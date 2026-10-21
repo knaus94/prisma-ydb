@@ -116,8 +116,8 @@ Unknown commit outcomes require reconciliation. Values travel as parameters.
 
 ## Guides
 
-Start with the [documentation index](docs/README.md). Detailed guides cover
-[relations and referential integrity](docs/relations.md),
-[migrations](docs/migrations.md), [transactions and retries](docs/transactions.md),
-[native YQL](docs/yql.md), [selections and DTOs](docs/selections.md),
-[NestJS](docs/nestjs.md), [operations](docs/operations.md) and the [API](docs/api.md).
+Start with the [documentation index](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/README.md). Detailed guides cover
+[relations and referential integrity](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/relations.md),
+[migrations](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/migrations.md), [transactions and retries](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/transactions.md),
+[native YQL](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/yql.md), [selections and DTOs](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/selections.md),
+[NestJS](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/nestjs.md), [operations](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/operations.md) and the [API](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/api.md).

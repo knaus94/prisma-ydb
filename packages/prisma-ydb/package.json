@@ -67,10 +67,8 @@
     "dist/**/*.js",
     "dist/**/*.d.ts",
     "dist/**/*.d.ts.map",
-    "src/**/*.ts",
     "README.md",
-    "LICENSE",
-    "docs/**/*.md"
+    "LICENSE"
   ],
   "keywords": [
     "prisma",

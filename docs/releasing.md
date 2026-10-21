@@ -21,8 +21,9 @@ to `latest`. Prepack builds the library; prepublish runs offline checks. Root
 release commands also validate the consumer. Dry run executes publication hooks
 without uploading. Inspect the tarball and install it in a clean consumer.
 
-Published files are allowlisted: compiled JS/types, declaration sources, docs and
-license. `.env`, databases, application migrations and Nx caches are excluded.
+Published files are allowlisted: compiled JavaScript, TypeScript declarations and
+declaration maps, README, license and package metadata. Sources, documentation
+guides, `.env`, databases, application migrations and Nx caches are excluded.
 Consumers do not need Nx or Yarn at runtime.
 
 ## GitHub
