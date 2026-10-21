@@ -53,6 +53,11 @@
     "tslib": "^2.3.0"
   },
   "description": "Native YDB driver, Prisma ORM 8 target and migrations",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/knaus94/prisma-ydb.git",
+    "directory": "packages/prisma-ydb"
+  },
   "license": "MIT",
   "engines": {
     "node": "^24.11.0 || >=26.0.0"
