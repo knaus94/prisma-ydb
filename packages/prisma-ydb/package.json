@@ -121,7 +121,7 @@
         ],
         "cache": false,
         "options": {
-          "command": "publint packages/prisma-ydb",
+          "command": "publint packages/prisma-ydb --pack npm",
           "cwd": "{workspaceRoot}"
         }
       }
