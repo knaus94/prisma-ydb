@@ -1,0 +1,125 @@
+{
+  "name": "prisma-ydb",
+  "version": "0.1.0-rc.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime/index.d.ts",
+      "import": "./dist/runtime/index.js",
+      "default": "./dist/runtime/index.js"
+    },
+    "./driver": {
+      "types": "./dist/driver/index.d.ts",
+      "import": "./dist/driver/index.js",
+      "default": "./dist/driver/index.js"
+    },
+    "./config": {
+      "types": "./dist/control/config.d.ts",
+      "import": "./dist/control/config.js",
+      "default": "./dist/control/config.js"
+    },
+    "./control": {
+      "types": "./dist/control/index.d.ts",
+      "import": "./dist/control/index.js",
+      "default": "./dist/control/index.js"
+    },
+    "./environment": {
+      "types": "./dist/environment.d.ts",
+      "import": "./dist/environment.js",
+      "default": "./dist/environment.js"
+    }
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.0",
+    "@prisma/cli-engine": "0.7.0",
+    "@prisma/management-api-sdk": "1.80.0",
+    "@prisma/orm-family-sql": "8.0.0-rc.18",
+    "@prisma/orm-framework": "8.0.0-rc.18",
+    "@prisma/orm-toolchain": "8.0.0-rc.18",
+    "@ydbjs/api": "6.0.7",
+    "@ydbjs/auth": "6.3.1",
+    "@ydbjs/core": "6.3.1",
+    "@ydbjs/error": "6.0.6",
+    "@ydbjs/value": "6.0.8",
+    "tslib": "^2.3.0"
+  },
+  "description": "Native YDB driver, Prisma ORM 8 target and migrations",
+  "license": "MIT",
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map",
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE",
+    "docs/**/*.md"
+  ],
+  "keywords": [
+    "prisma",
+    "ydb",
+    "yql",
+    "driver",
+    "orm",
+    "migrations"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "next"
+  },
+  "scripts": {
+    "prepack": "node ../../.yarn/releases/yarn-4.18.1.cjs run -T nx build prisma-ydb",
+    "prepublishOnly": "node ../../.yarn/releases/yarn-4.18.1.cjs run -T check"
+  },
+  "nx": {
+    "name": "prisma-ydb",
+    "targets": {
+      "lint": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "inputs": [
+          "{projectRoot}/src/**/*.ts",
+          "{workspaceRoot}/eslint.config.mjs",
+          "{workspaceRoot}/package.json",
+          "{workspaceRoot}/yarn.lock"
+        ],
+        "options": {
+          "command": "eslint packages/prisma-ydb/src",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "typecheck": {
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "tsc --build tsconfig.json"
+        }
+      },
+      "package-check": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "cache": false,
+        "options": {
+          "command": "publint packages/prisma-ydb",
+          "cwd": "{workspaceRoot}"
+        }
+      }
+    }
+  }
+}

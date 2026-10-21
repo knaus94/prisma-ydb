@@ -1,0 +1,195 @@
+{
+  "name": "@prisma-ydb/example-basic",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "nx": {
+    "name": "basic",
+    "targets": {
+      "generate": {
+        "executor": "nx:run-commands",
+        "cache": true,
+        "options": {
+          "command": "prisma contract emit",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ],
+        "inputs": [
+          "{projectRoot}/prisma/contract.prisma",
+          "{projectRoot}/prisma.config.ts",
+          "{projectRoot}/package.json",
+          "{workspaceRoot}/yarn.lock",
+          {
+            "dependentTasksOutputFiles": "**/*.js",
+            "transitive": true
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/src/generated"
+        ]
+      },
+      "build": {
+        "dependsOn": [
+          "generate",
+          "^build"
+        ]
+      },
+      "typecheck": {
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "tsc --build tsconfig.json"
+        }
+      },
+      "lint": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "eslint src prisma.config.ts",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "run": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "node dist/main.js",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          "build"
+        ]
+      },
+      "migration-create": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma migration plan",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "migration-new": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma migration new",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "migration-check": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma migration check",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "migrate": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma db migrate",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "verify": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma db verify",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "status": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma migration status",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      },
+      "infer": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "prisma contract infer --output inferred.prisma",
+          "cwd": "{projectRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "dependencies": {
+    "@prisma/orm-family-sql": "8.0.0-rc.18",
+    "@prisma/orm-framework": "8.0.0-rc.18",
+    "dotenv": "17.4.2",
+    "prisma-ydb": "workspace:*",
+    "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "prisma": "8.0.0-rc.24"
+  }
+}

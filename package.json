@@ -1,0 +1,218 @@
+{
+  "name": "prisma-ydb",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "yarn@4.18.1",
+  "engines": {
+    "node": "^24.11.0 || >=26.0.0"
+  },
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "devDependencies": {
+    "@eslint/js": "9.39.4",
+    "@nx/js": "23.3.0",
+    "@swc/helpers": "~0.5.18",
+    "@types/node": "24.10.0",
+    "eslint": "9.39.4",
+    "nx": "23.3.0",
+    "prettier": "3.8.1",
+    "publint": "0.3.25",
+    "tslib": "^2.3.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.58.0"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "nx build prisma-ydb",
+    "lint": "nx run-many -t lint -p prisma-ydb,basic",
+    "typecheck": "nx run-many -t typecheck -p prisma-ydb,basic",
+    "check": "nx run-many -t lint,typecheck,build,package-check,migration-check -p prisma-ydb,basic && nx run workspace:scripts-lint",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "release:dry-run": "nx run workspace:publish-dry-run",
+    "release:publish": "nx run workspace:publish",
+    "release:version": "node scripts/version.mjs",
+    "example:generate": "nx run basic:generate",
+    "example:run": "nx run basic:run",
+    "db:up": "nx run workspace:docker-up",
+    "db:down": "nx run workspace:docker-down",
+    "db:logs": "nx run workspace:docker-logs",
+    "db:migration:create": "nx run basic:migration-create",
+    "db:migration:new": "nx run basic:migration-new",
+    "db:migration:check": "nx run basic:migration-check",
+    "db:migrate": "nx run basic:migrate",
+    "db:verify": "nx run basic:verify",
+    "db:status": "nx run basic:status",
+    "db:infer": "nx run basic:infer",
+    "package:pack": "nx run workspace:pack"
+  },
+  "nx": {
+    "name": "workspace",
+    "targets": {
+      "scripts-lint": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "eslint scripts eslint.config.mjs",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "pack": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "node scripts/package.mjs pack",
+          "cwd": "{workspaceRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "typecheck",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "lint",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "package-check",
+            "projects": [
+              "prisma-ydb"
+            ]
+          },
+          {
+            "target": "migration-check",
+            "projects": [
+              "basic"
+            ]
+          }
+        ]
+      },
+      "publish-dry-run": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "node scripts/package.mjs dry-run",
+          "cwd": "{workspaceRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "typecheck",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "lint",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "package-check",
+            "projects": [
+              "prisma-ydb"
+            ]
+          },
+          {
+            "target": "migration-check",
+            "projects": [
+              "basic"
+            ]
+          }
+        ]
+      },
+      "publish": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "node scripts/package.mjs publish",
+          "cwd": "{workspaceRoot}"
+        },
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "typecheck",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "lint",
+            "projects": [
+              "prisma-ydb",
+              "basic"
+            ]
+          },
+          {
+            "target": "package-check",
+            "projects": [
+              "prisma-ydb"
+            ]
+          },
+          {
+            "target": "migration-check",
+            "projects": [
+              "basic"
+            ]
+          }
+        ]
+      },
+      "docker-up": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "docker compose -f docker/compose.yaml up -d --wait",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "docker-down": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "docker compose -f docker/compose.yaml down",
+          "cwd": "{workspaceRoot}"
+        }
+      },
+      "docker-logs": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "options": {
+          "command": "docker compose -f docker/compose.yaml logs --tail=100",
+          "cwd": "{workspaceRoot}"
+        }
+      }
+    }
+  }
+}

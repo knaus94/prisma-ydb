@@ -1,0 +1,110 @@
+[
+  {
+    "id": "table.Project.0",
+    "label": "CREATE TABLE `Project` (`id` Utf8 NOT NULL, `name` Utf8 NOT NULL, PRIMARY KEY (`id`))",
+    "operationClass": "additive",
+    "target": {
+      "id": "ydb",
+      "details": {
+        "table": "Project"
+      }
+    },
+    "precheck": [],
+    "execute": [
+      {
+        "description": "CREATE TABLE `Project` (`id` Utf8 NOT NULL, `name` Utf8 NOT NULL, PRIMARY KEY (`id`))",
+        "sql": "CREATE TABLE `Project` (`id` Utf8 NOT NULL, `name` Utf8 NOT NULL, PRIMARY KEY (`id`))"
+      }
+    ],
+    "postcheck": [],
+    "meta": {
+      "ydbBefore": null,
+      "ydbAfter": {
+        "columns": {
+          "id": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          },
+          "name": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          }
+        },
+        "primaryKey": [
+          "id"
+        ],
+        "indexes": [],
+        "uniques": []
+      }
+    }
+  },
+  {
+    "id": "table.Task.1",
+    "label": "CREATE TABLE `Task` (`createdAt` Timestamp NOT NULL, `done` Bool NOT NULL DEFAULT false, `id` Utf8 NOT NULL, `projectId` Utf8, `title` Utf8 NOT NULL, PRIMARY KEY (`id`), INDEX `Task_projectId_idx_a96e4d92` GLOBAL SYNC ON (`projectId`))",
+    "operationClass": "additive",
+    "target": {
+      "id": "ydb",
+      "details": {
+        "table": "Task"
+      }
+    },
+    "precheck": [],
+    "execute": [
+      {
+        "description": "CREATE TABLE `Task` (`createdAt` Timestamp NOT NULL, `done` Bool NOT NULL DEFAULT false, `id` Utf8 NOT NULL, `projectId` Utf8, `title` Utf8 NOT NULL, PRIMARY KEY (`id`), INDEX `Task_projectId_idx_a96e4d92` GLOBAL SYNC ON (`projectId`))",
+        "sql": "CREATE TABLE `Task` (`createdAt` Timestamp NOT NULL, `done` Bool NOT NULL DEFAULT false, `id` Utf8 NOT NULL, `projectId` Utf8, `title` Utf8 NOT NULL, PRIMARY KEY (`id`), INDEX `Task_projectId_idx_a96e4d92` GLOBAL SYNC ON (`projectId`))"
+      }
+    ],
+    "postcheck": [],
+    "meta": {
+      "ydbBefore": null,
+      "ydbAfter": {
+        "columns": {
+          "createdAt": {
+            "type": "Timestamp",
+            "nullable": false,
+            "default": null
+          },
+          "done": {
+            "type": "Bool",
+            "nullable": false,
+            "default": {
+              "kind": "literal",
+              "value": false
+            }
+          },
+          "id": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          },
+          "projectId": {
+            "type": "Utf8",
+            "nullable": true,
+            "default": null
+          },
+          "title": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          }
+        },
+        "primaryKey": [
+          "id"
+        ],
+        "indexes": [
+          {
+            "name": "Task_projectId_idx_a96e4d92",
+            "columns": [
+              "projectId"
+            ],
+            "unique": false
+          }
+        ],
+        "uniques": []
+      }
+    }
+  }
+]

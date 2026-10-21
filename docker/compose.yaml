@@ -1,0 +1,21 @@
+name: prisma-ydb-example
+services:
+  ydb:
+    image: ydbplatform/local-ydb@sha256:9e46fd45875551a75bcf34d0bb9ca0baa1d8763a4ccf2070af45f4467c4b7402
+    hostname: localhost
+    ports:
+      - '127.0.0.1:2137:2137'
+      - '127.0.0.1:8766:8766'
+    environment:
+      GRPC_PORT: '2137'
+      MON_PORT: '8766'
+      YDB_GRPC_ENABLE_TLS: '0'
+      YDB_PDISK_SIZE: '8GB'
+      YDB_DEFAULT_LOG_LEVEL: WARN
+    volumes:
+      - data:/ydb_data
+    mem_limit: 4g
+    cpus: 2
+    stop_grace_period: 30s
+volumes:
+  data:

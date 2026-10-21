@@ -1,0 +1,8 @@
+node_modules
+.yarn
+.nx
+**/dist
+**/generated
+**/migrations
+artifacts
+yarn.lock
