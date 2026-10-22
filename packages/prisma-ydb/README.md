@@ -54,7 +54,7 @@ model Task {
   id        String   @id @default(uuid())
   title     String
   done      Boolean  @default(false)
-  createdAt DateTime
+  createdAt temporal.createdAt()
 }
 ```
 
@@ -86,7 +86,6 @@ try {
     async (tx) => {
       const created = await tx.orm.Task.create({
         title: 'YDB',
-        createdAt: new Date(),
       });
       await tx.yql(
         'DECLARE $id AS Utf8; UPDATE `Task` SET done = TRUE WHERE id = $id',
@@ -114,7 +113,36 @@ Unknown commit outcomes require reconciliation. Values travel as parameters.
 | `prisma-ydb/control`     | Migration authoring and control plane             |
 | `prisma-ydb/environment` | SDK environment authentication/TLS                |
 
+## String enums
+
+Enums declared in `.prisma` generate literal types for writes, filters and query
+results. Their values are stored as YDB `Utf8`:
+
+```prisma
+enum TaskStatus {
+  TODO
+  DOING
+  DONE
+}
+```
+
+Add `status TaskStatus @default(TODO)` to a model and regenerate the contract.
+Use `db.enums.TaskStatus.members.TODO` (or `tx.enums.TaskStatus.members.TODO` in a
+transaction). `typeof db.enums.TaskStatus.Value` gives the value type;
+`db.enums.TaskStatus.has(value)` validates external input and narrows its type.
+Membership is not automatically checked on reads or writes. Explicit stored
+strings use `TODO = "todo"`. See the
+[enum API guide](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/api.md#string-enums).
+
 ## Guides
+
+Native `temporal.*` presets provide automatic timestamps. Schema types include
+`Decimal(p, s)`, calendar `Date` and microsecond `Timestamp`; scalar/enum lists and
+typed nested value objects use Json storage with JSON-path/list filters. See the
+[type and query API](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/api.md).
+Client-side referential actions support Cascade, SetNull and Restrict. Schema TTL
+policies are planned, applied and introspected through the migration workflow.
+Raw YQL writes bypass automatic timestamps and referential actions.
 
 Start with the [documentation index](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/README.md). Detailed guides cover
 [relations and referential integrity](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/relations.md),

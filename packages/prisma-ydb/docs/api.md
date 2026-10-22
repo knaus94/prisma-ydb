@@ -84,6 +84,59 @@ without retries. Its default timeout is the smaller of 5000ms and
 Client readiness becomes false as soon as `close()` starts, including while
 Prisma drains pending work and when an earlier readiness probe finishes during shutdown.
 
+## String enums
+
+Declare enums in the authored `.prisma` contract and run `prisma contract emit`:
+
+```prisma
+enum TaskStatus {
+  TODO
+  DOING
+  DONE
+}
+
+model Task {
+  id     String     @id @default(uuid())
+  status TaskStatus @default(TODO)
+}
+```
+
+The column uses YDB `Utf8` and the `ydb/utf8@1` codec. Generated input and output
+types contain the permitted string literals, including in filters and selections.
+`TaskStatus?` adds `null`; a default lets creates omit the field.
+
+```ts
+const Status = db.enums.TaskStatus;
+type TaskStatus = typeof Status.Value;
+
+await db.orm.Task.create({ status: Status.members.TODO });
+const tasks = await db.orm.Task.where({ status: Status.members.DOING }).all();
+
+function parseStatus(value: unknown): TaskStatus {
+  if (!Status.has(value)) throw new TypeError('Unknown task status');
+  return value;
+}
+```
+
+The accessor also exposes `values`, `names`, `hasName`, `nameOf` and `ordinalOf`.
+`Value` is type-only: use it in `typeof`, never read it at runtime.
+`db.enums.__unbound__.TaskStatus` remains available and refers to the same accessor.
+Transactions expose the same API through `tx.enums.TaskStatus`. Enum access does
+not require connecting to YDB. If an enum is named `__unbound__`, use
+`db.enums.__unbound__.__unbound__` to avoid the namespace-name collision.
+
+By default each member stores its name. Explicit values use Prisma 8 syntax,
+for example `TODO = "todo"`; then `Status.members.TODO` and query results contain
+`"todo"`. There is no ordinal conversion. The client does not automatically
+validate enum membership on reads or writes, and YDB has no corresponding
+constraint. Validate external data with `.has()`; values written through `any`,
+JavaScript or direct YQL can otherwise fall outside the generated type.
+
+Contract printing preserves string enum definitions, field types and defaults.
+Database inference returns `String` because YDB stores no enum definition.
+Enum-only changes update contract metadata and hashes without changing the
+physical column; follow the usual migration/snapshot workflow.
+
 ## Driver options and retries
 
 The following driver options supplement the limits shown above. Unknown option
@@ -141,7 +194,7 @@ caller abandoned before its terminal status. Warm-up opens the missing
 
 ## Transactions and raw YQL
 
-`db.transaction(async tx => ...)` provides `tx.orm`, `tx.sql`, `tx.raw`,
+`db.transaction(async tx => ...)` provides `tx.orm`, `tx.sql`, `tx.raw`, `tx.enums`,
 `tx.query`, `tx.execute`, `tx.yql` and `tx.queryYql` on one native session and
 transaction ID. Success awaits commit acknowledgement; failure awaits rollback.
 Transaction callbacks are not retried by default. Opt in with
@@ -245,22 +298,121 @@ rows. Split large mutations into bounded batches when necessary.
 | `Boolean`       | `Bool`          | `boolean`                                  |
 | `Float`         | `Double`        | finite `number`                            |
 | `DateTime`      | `Timestamp`     | `Date`; truncates to milliseconds          |
+| `Date`          | `Date`          | UTC calendar string `YYYY-MM-DD`           |
+| `Timestamp`     | `Timestamp`     | UTC ISO string with six fractional digits  |
 | `Json`          | `Json`          | JSON values, including scalar strings/null |
 | `Bytes`         | binary `String` | `Uint8Array`                               |
 | `Decimal`       | `Decimal(22,9)` | exact decimal `string`                     |
+| `Decimal(p, s)` | `Decimal(p,s)`  | exact decimal `string`                     |
 
-ORM Timestamp decoding, including relation includes, truncates microseconds to
-milliseconds. Writes remain millisecond-exact JavaScript `Date` values. Native
+ORM `DateTime` decoding, including relation includes, truncates microseconds to
+milliseconds. Its writes use JavaScript `Date` values. Native
 relation formatting preserves fractional seconds before ORM decoding.
 Raw Timestamp values preserve microseconds as `bigint`. Raw Decimal values
 preserve exact decimal strings; native `DecimalValue` accepts explicit precision
 and scale up to YDB's precision limit of 35. Non-finite decimals and nonzero
 digits beyond the requested scale are rejected. Aggregate `count()` and integer `sum()` reject
-unsafe number conversion; use the bigint variants for larger values. SQL array
-columns are unsupported; native YQL list/struct parameters remain available.
+unsafe number conversion; use the bigint variants for larger values. Scalar and
+enum lists use Json columns; native YQL list/struct parameters remain available.
 The pinned Prisma SQL-family validator rejects a non-nullable `Json` field with
 a literal JSON-null storage default. Nullable JSON defaults can represent JSON
 null; use native wire mode when the distinction from SQL NULL must be inspected.
+
+`Decimal(p, s)` accepts precision 1–35 and scale 0–precision. Both arguments are
+required together; bare `Decimal` remains `(22,9)` and keeps its contract shape.
+Use exact strings, such as `'1234.50'`, without exponent notation.
+`Date` accepts a real calendar-date string or a JS `Date` (its UTC calendar day).
+`Timestamp` accepts UTC strings with zero to six fractional digits, or a JS `Date`
+(milliseconds padded to microseconds). Output is canonical, for example
+`2026-10-22T12:34:56.123456Z`. All three temporal codecs accept dates from 1970
+through 2105. Date32 and Timestamp64 are outside this target's schema support.
+
+## Automatic timestamps
+
+Use native Prisma 8 field presets:
+
+```prisma
+createdAt temporal.createdAt()
+updatedAt temporal.updatedAt()
+publishedOn temporal.Date(onCreate: now)
+observedAt temporal.Timestamp(onCreate: now, onUpdate: now)
+```
+
+`temporal.createdAt()` sets a DateTime on create; `temporal.updatedAt()` sets it
+on create and every nonempty update. `temporal.DateTime`, `temporal.Date` and
+`temporal.Timestamp` accept optional `onCreate: now` and `onUpdate: now` phases.
+One application timestamp is shared by defaults of a lowered mutation.
+Raw YQL writes bypass these defaults. `@default(now())` is rejected; use a preset.
+Presets cannot be optional (`?`) in rc.18. Adding a required timestamp to a populated
+table needs a reviewed backfill, as shown by the basic example migrations.
+
+## Value objects and JSON paths
+
+Prisma `type` blocks describe typed value objects, including nested objects;
+their fields are stored in a single `Json` column. For example:
+
+```prisma
+type Settings {
+  theme String?
+}
+model Project {
+  id String @id
+  settings Settings?
+}
+```
+
+JSON fields expose `jsonString(path)`, `jsonNumber(path)`, `jsonBoolean(path)`,
+`jsonExists(path)` and `jsonIsNull(path)`. String/number results support comparisons:
+
+```ts
+db.orm.Project.where((p) => p.settings.jsonString('theme').eq('dark'));
+db.orm.Project.where((p) => p.settings.jsonBoolean('notifications.email'));
+```
+
+Paths are dotted strings or arrays of string/number segments, such as
+`['items', 0, 'name']`. They are strictly validated, escaped JsonPath literals in
+the query text; YDB does not accept a JsonPath parameter. Control characters and
+empty keys are rejected.
+
+| Column/path state | jsonString/Number/Boolean             | jsonExists | jsonIsNull |
+| ----------------- | ------------------------------------- | ---------- | ---------- |
+| SQL NULL column   | NULL                                  | NULL       | NULL       |
+| Missing path      | NULL                                  | false      | false      |
+| JSON null         | NULL                                  | true       | true       |
+| Present scalar    | Value if type matches, otherwise NULL | true       | false      |
+
+Predicates select only true. `jsonBoolean` is a nullable predicate: use it directly
+for JSON true. `not(p.settings.jsonBoolean(path))`, with `not` imported from
+`@prisma/orm-family-sql/orm-client`, matches explicit false; missing/null values
+remain NULL and do not match.
+
+## Scalar and enum lists
+
+`String[]`, numeric, Boolean, Decimal, temporal, Bytes and enum lists store a Json
+array of each element's JSON form. BigInt uses decimal strings, Bytes uses base64,
+and temporal values use UTC strings. Elements cannot be null. Json/value-object
+lists are rejected. Reads decode the element codec; writes replace the whole
+array. Atomic push/remove and PostgreSQL array parity are not supported.
+
+```ts
+await db.orm.Project.where({ id }).update({ tags: ['prisma', 'ydb'] });
+db.orm.Project.where((p, { fns }) => fns.has(p.tags, 'ydb').buildAst());
+db.orm.Project.where((p, { fns }) =>
+  fns.hasSome(p.tags, ['ydb', 'other']).buildAst(),
+);
+db.orm.Project.where((p, { fns }) =>
+  fns.hasEvery(p.tags, ['prisma', 'ydb']).buildAst(),
+);
+db.orm.Project.where((p, { fns }) => fns.isEmpty(p.tags).buildAst());
+```
+
+Use `fns` in rc.18: list field methods are not exposed. Needles compare in the
+element's JSON form. The pinned ORM's function-condition type hardcodes a
+PostgreSQL boolean codec; `.buildAst()` passes the native expression through its
+supported `WhereArg` overload without a cast.
+`hasSome([])` is false, `hasEvery([])` is true and `isEmpty()`
+is true for `[]`. SQL NULL propagates. Scalar-column `in([...])` still uses a
+native YQL list parameter and is distinct from list-column storage.
 
 ## Relations
 
@@ -270,9 +422,10 @@ deletion policies and concurrency examples.
 For PSL, opt into `relationMode: 'application'` in `defineYdbConfig` and use
 ordinary `@relation(fields: [...], references: [...])`. The official namespace
 authoring hook retains query relations and indexes while omitting physical FKs
-before contract hashing. The application owns referential integrity; raw YQL
-can bypass its checks. Explicit `onDelete`/`onUpdate` actions are rejected rather
-than ignored. Persisted contracts with physical FKs are still rejected.
+before contract hashing. Action-bearing relations retain client-side metadata:
+`onDelete: Cascade | SetNull | Restrict` is supported; NoAction-only declarations
+are rejected (use Restrict). `onUpdate` supports NoAction/Restrict only. Raw YQL
+bypasses these checks. Relations without actions remain unenforced query metadata.
 TypeScript contracts use `constraint: false`, because YDB does not enforce foreign
 keys. Includes lower to native grouped joins and typed lists/structs. They support
 to-many and optional to-one relations, nested includes, composite equality keys,
@@ -324,7 +477,7 @@ dedicated database for the managed contract; unrelated tables are not silently
 accepted during final schema verification.
 
 Unique indexes can be created with a new table. Adding a unique index to an
-existing table is rejected on the pinned YDB version. TTL/tiering, column tables,
+existing table is rejected on the pinned YDB version. Numeric TTL/tiering, column tables,
 covering or asynchronous indexes and indexes still being built are not silently
 converted to ordinary row-table contracts. Partitioning and replica settings are
 operational configuration outside the schema model.
@@ -383,8 +536,9 @@ Unsupported operations produce explicit errors. Current boundaries include:
 
 - No database foreign keys or CHECK constraints; relation metadata must use
   `constraint: false` in TypeScript authoring, or explicit PSL `relationMode: 'application'`. Database cascades are not available.
-- No SQL namespaces, array columns, native enum types, partial/expression indexes,
+- No SQL namespaces, native SQL array columns (lists are stored as Json), native enum types, partial/expression indexes,
   `DISTINCT ON`, LATERAL joins or row locking clauses.
+  String enums are supported as client types and accessors over `Utf8` columns.
 - Upsert uses primary keys with distinct create/update branches. Non-primary
   conflict targets and conflict-skipping bulk inserts are rejected.
 - Repeated junction `connect` that relies on swallowing a duplicate insert is
@@ -393,7 +547,7 @@ Unsupported operations produce explicit errors. Current boundaries include:
 - ORM `createAll()` groups rows by supplied fields and can apply omitted defaults.
   A manually constructed heterogeneous SQL-lane INSERT with per-row `DEFAULT`
   expressions is rejected.
-- `@default(now())` is rejected. Literal storage defaults, UUID/ULID and other
+- `@default(now())` is rejected; use native `temporal.*` presets. Literal storage defaults, UUID/ULID and other
   supported runtime ID generators are separate from database clock defaults.
 - Serial/BigSerial storage defaults are allowed only in primary keys. Sequence
   values can be consumed by failed/rolled-back inserts, as documented by YDB.

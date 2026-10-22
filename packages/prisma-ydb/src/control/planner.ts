@@ -15,14 +15,21 @@ import {
   SqlSchemaIR,
   type SqlTableIR,
 } from '@prisma/orm-family-sql/schema-ir/types';
-import { ydbContractSerializer, quoteYdbIdentifier as q } from './contract.js';
+import {
+  ydbContractSerializer,
+  quoteYdbIdentifier as q,
+  ydbDuration,
+  type YdbTtl,
+} from './contract.js';
 import {
   ydbContractToSchema,
   renderYdbColumn,
   renderYdbLiteral,
+  ydbTableTtl,
 } from './schema.js';
 
 interface TableShape {
+  ttl?: YdbTtl;
   columns: Record<
     string,
     { type: string; nullable: boolean; default: unknown }
@@ -54,6 +61,7 @@ export function stableShape(value: unknown): string {
 export function tableShape(table: SqlTableIR | undefined): unknown {
   if (!table) return null;
   return {
+    ...(ydbTableTtl(table) ? { ttl: ydbTableTtl(table) } : {}),
     columns: Object.fromEntries(
       Object.entries(table.columns)
         .sort(([a], [b]) => a.localeCompare(b))
@@ -218,7 +226,12 @@ function createTable(table: SqlTableIR): string {
     definitions.push(
       `INDEX ${q(unique.name ?? `${table.name}_unique_${index}`)} GLOBAL UNIQUE SYNC ON (${unique.columns.map(q).join(', ')})`,
     );
-  return `CREATE TABLE ${q(table.name)} (${definitions.join(', ')})`;
+  const ttl = ydbTableTtl(table);
+  return `CREATE TABLE ${q(table.name)} (${definitions.join(', ')})${ttl ? ` WITH (TTL = ${renderTtl(ttl)})` : ''}`;
+}
+
+function renderTtl(ttl: YdbTtl): string {
+  return `Interval(${JSON.stringify(ydbDuration(ttl.expireAfterSeconds))}) ON ${q(ttl.column)}`;
 }
 
 export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
@@ -321,6 +334,11 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
         }
         if (!before || !after || !desired || !state)
           throw new Error('Invalid YDB schema diff state.');
+        if (state.ttl && !desired.ttl) {
+          const next = clone();
+          delete next.ttl;
+          step(`ALTER TABLE ${q(name)} RESET (TTL)`, 'additive', next);
+        }
         if (
           JSON.stringify(before.primaryKey?.columns) !==
           JSON.stringify(after.primaryKey?.columns)
@@ -495,6 +513,18 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
               `YDB 26.2 cannot add a unique index to existing table ${name} with ALTER TABLE. Declare uniqueness at CREATE TABLE or perform a reviewed table reconstruction.`,
             );
           }
+        }
+        if (
+          desired.ttl &&
+          stableShape(state.ttl) !== stableShape(desired.ttl)
+        ) {
+          const next = clone();
+          next.ttl = desired.ttl;
+          step(
+            `ALTER TABLE ${q(name)} SET (TTL = ${renderTtl(desired.ttl)})`,
+            'destructive',
+            next,
+          );
         }
         if (stableShape(state) !== stableShape(desired))
           throw new Error(

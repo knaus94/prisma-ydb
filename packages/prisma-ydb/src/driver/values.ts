@@ -17,12 +17,14 @@ import {
   PrimitiveType,
   Text,
   Uint64,
+  Json,
 } from '@ydbjs/value/primitive';
 import type {
   YdbParameter,
   YdbQueryRequest,
   YdbSqlExecuteRequest,
 } from './types.js';
+import { ydbJsonForm } from './json-form.js';
 
 const primitiveTypes: Record<string, PrimitiveId> = {
   Bool: PrimitiveId.BOOL,
@@ -46,6 +48,7 @@ const primitiveTypes: Record<string, PrimitiveId> = {
   Interval: PrimitiveId.INTERVAL,
   Uuid: PrimitiveId.UUID,
 };
+const jsonParameterType = /^Json\??$/;
 
 /** Parses only the compiler's small parameter-type grammar, never SQL text. */
 function parameterType(name: string, depth = 0): Type {
@@ -183,8 +186,26 @@ export function sqlRequest(
         throw new SqlQueryError(
           'Array YDB parameters require compiler type metadata',
         );
+      const value = jsonParameterType.test(declared)
+        ? new Json(
+            JSON.stringify(
+              parameter.map((element: unknown) => {
+                if (
+                  typeof element !== 'object' ||
+                  element === null ||
+                  !(ydbJsonForm in element) ||
+                  typeof element[ydbJsonForm] !== 'function'
+                )
+                  throw new SqlQueryError(
+                    'YDB list columns require non-null codec-encoded elements',
+                  );
+                return element[ydbJsonForm]();
+              }),
+            ),
+          )
+        : parameter;
       parameters[`p${index + 1}`] = typedValue(
-        parameter,
+        value,
         declaredType(header, index, declared),
       );
     } else if (isParameter(parameter)) {

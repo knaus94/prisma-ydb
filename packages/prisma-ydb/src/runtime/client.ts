@@ -57,6 +57,7 @@ import {
   type YdbQueryResult,
 } from '../driver/index.js';
 import { ydbContractSerializer } from '../control/contract.js';
+import { YdbJsonElement } from './codecs.js';
 import {
   createYdbRuntimeAdapter,
   readYdbRuntimeMarker,
@@ -71,6 +72,12 @@ type GenericOrm<C extends Contract<SqlStorage>> = ReturnType<
 >;
 type YdbOrm<C extends Contract<SqlStorage>> = GenericOrm<C> &
   GenericOrm<C>[keyof C['domain']['namespaces'] & keyof GenericOrm<C>];
+/** Flat enum access for YDB's sole namespace, retaining namespaced access. */
+export type YdbEnums<C extends Contract<SqlStorage>> = NamespacedEnums<C> &
+  Omit<
+    NamespacedEnums<C>[keyof C['domain']['namespaces']],
+    keyof NamespacedEnums<C>
+  >;
 export interface YdbOptions<C extends Contract<SqlStorage>> {
   readonly contractJson?: unknown;
   readonly contract?: C;
@@ -87,7 +94,7 @@ export interface YdbQueryMembers<
   readonly orm: YdbOrm<C>;
   readonly sql: Db<C>;
   readonly raw: RawLane<C>;
-  readonly enums: NamespacedEnums<C>;
+  readonly enums: YdbEnums<C>;
   /** Native YQL; Timestamp columns remain bigint microseconds so no precision is lost. */
   yql(
     text: string,
@@ -152,7 +159,24 @@ function linkSignals(parent: AbortSignal, caller?: AbortSignal) {
   };
 }
 
-class YdbRuntime<C extends Contract<SqlStorage>> extends SqlRuntimeBase<C> {}
+class YdbRuntime<C extends Contract<SqlStorage>> extends SqlRuntimeBase<C> {
+  protected override getListDecoder() {
+    return async (
+      wire: unknown,
+      decode: (value: unknown) => Promise<unknown>,
+    ) => {
+      if (!Array.isArray(wire))
+        throw new TypeError('YDB list columns require JSON arrays');
+      return Promise.all(
+        wire.map((value) => {
+          if (value === null)
+            throw new TypeError('YDB list elements cannot be null');
+          return decode(new YdbJsonElement(value));
+        }),
+      );
+    };
+  }
+}
 
 const transactionPrimaryFailures = new WeakMap<Error, unknown>();
 
@@ -277,7 +301,7 @@ export function ydb<C extends Contract<SqlStorage>>(
     let sql: Db<C> | undefined;
     let raw: RawLane<C> | undefined;
     let orm: YdbOrm<C> | undefined;
-    let enums: NamespacedEnums<C> | undefined;
+    let enums: YdbEnums<C> | undefined;
     const scoped: RuntimeQueryable = {
       query(plan, executionOptions) {
         checkActive();
@@ -333,6 +357,24 @@ export function ydb<C extends Contract<SqlStorage>>(
         },
       }) as YdbOrm<C>;
     };
+    const createEnums = (): YdbEnums<C> => {
+      const namespaced = buildNamespacedEnums<C>(contract.domain, (codecId) =>
+        context.contractCodecs.forCodecRef({ codecId }),
+      );
+      const namespaces = Object.keys(contract.domain.namespaces);
+      const namespace = namespaces[0];
+      if (!namespace || namespaces.length !== 1)
+        throw new Error('YDB expects one domain namespace');
+      const facet: object = Reflect.get(namespaced, namespace);
+      for (const name of Object.keys(facet)) {
+        if (Object.hasOwn(namespaced, name)) continue;
+        Object.defineProperty(namespaced, name, {
+          enumerable: true,
+          get: () => Reflect.get(facet, name),
+        });
+      }
+      return namespaced as YdbEnums<C>;
+    };
     const queryYql = async (request: YdbQueryRequest) => {
       checkActive();
       if (boundRuntime === runtime) await ensureConnected();
@@ -356,9 +398,7 @@ export function ydb<C extends Contract<SqlStorage>>(
         }));
       },
       get enums() {
-        return (enums ??= buildNamespacedEnums<C>(contract.domain, (codecId) =>
-          context.contractCodecs.forCodecRef({ codecId }),
-        ));
+        return (enums ??= createEnums());
       },
       queryYql,
       async yql(text, parameters) {

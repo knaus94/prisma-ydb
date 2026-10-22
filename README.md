@@ -84,6 +84,7 @@ the authored source remains `.prisma`.
 - [Extraction origin](docs/ORIGIN.md)
 
 YDB has no foreign keys. `relationMode: 'application'` retains ORM relations;
-applications own reference checks and deletion rules. Explicit referential actions
-are rejected. DDL is not transactional. Savepoints and automatic cascades are unsupported. Earlier application-repository results
+action-bearing relations apply client-side Cascade, SetNull or Restrict rules.
+Raw writes bypass them; relations without actions remain unenforced metadata.
+DDL is not transactional and savepoints are unsupported. Earlier application-repository results
 do not certify this extracted release; qualify it against your workload.

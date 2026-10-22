@@ -5,18 +5,19 @@ native YDB queries, a Prisma ORM 8 target and schema migrations.
 
 | Guide                                               | What it covers                                                                               |
 | --------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [Relations and referential integrity](relations.md) | `@relation`, includes, parent checks, deletion policies and concurrency without database FKs |
-| [Schema and migrations](migrations.md)              | Authoring `.prisma`, generating changes, snapshots, deployment, drift and recovery           |
+| [Relations and referential integrity](relations.md) | `@relation`, includes, client-side Cascade/SetNull/Restrict, parent checks and concurrency   |
+| [Schema and migrations](migrations.md)              | Authoring `.prisma`, generating changes, TTL, snapshots, deployment, drift and recovery      |
 | [Transactions and retries](transactions.md)         | Commit/rollback, callback replay, timeouts and unknown outcomes                              |
 | [Native YQL and types](yql.md)                      | Typed parameters, result sets, streaming and data representations                            |
 | [Shared selections and DTOs](selections.md)         | Fragments, inferred result types and DTO compatibility                                       |
 | [NestJS integration](nestjs.md)                     | Singleton lifecycle, readiness and shutdown                                                  |
 | [Configuration and operations](operations.md)       | Authentication, TLS, pool settings, limits, metrics and deployment                           |
-| [API reference](api.md)                             | Public entry points, detailed behavior and supported boundaries                              |
+| [API reference](api.md)                             | Types, automatic timestamps, enums, JSON paths, lists, entry points and supported boundaries |
 
 The source workspace additionally contains a runnable `examples/basic` consumer,
 local Docker configuration, and maintainer guides in `docs/architecture.md` and
-`docs/releasing.md`. All guides in this directory ship in the npm package.
+`docs/releasing.md`. These guides live in the GitHub repository; the npm package
+ships compiled code, type declarations, the package README and the license.
 
 ## Capability overview
 

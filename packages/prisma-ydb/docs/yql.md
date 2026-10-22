@@ -28,6 +28,23 @@ ORM queries encode values automatically using the contract.
 
 ## Result sets, timeouts and statistics
 
+Use exact native typed values for parameterized decimals and microseconds:
+
+```ts
+import { DecimalValue, TimestampMicrosValue } from 'prisma-ydb/runtime';
+
+await db.yql(
+  'DECLARE $price AS Decimal(12,2); DECLARE $at AS Timestamp; SELECT $price AS price, $at AS at;',
+  {
+    price: new DecimalValue('1234.50', 12, 2),
+    at: new TimestampMicrosValue('2026-10-22T12:34:56.123456Z'),
+  },
+);
+```
+
+Raw writes bypass `temporal.*` presets and client-side referential actions.
+Supply automatic fields and maintain reference invariants explicitly.
+
 ```ts
 const result = await db.queryYql({
   text: 'SELECT CurrentUtcTimestamp() AS ts; SELECT 1 AS n;',
@@ -85,28 +102,30 @@ by default.
 
 ## JavaScript representations
 
-| Type            | ORM                                               | Decoded native YQL    |
-| --------------- | ------------------------------------------------- | --------------------- |
-| Utf8            | `string`                                          | `string`              |
-| Bool            | `boolean`                                         | `boolean`             |
-| Int32           | `number`                                          | `number`              |
-| Int64 / Uint64  | `bigint`                                          | `bigint`              |
-| Double          | finite `number`                                   | `number`              |
-| Timestamp       | `Date`; microseconds truncated to milliseconds    | `bigint` microseconds |
-| Decimal         | exact decimal string; ORM default `Decimal(22,9)` | exact decimal string  |
-| String (binary) | `Uint8Array`                                      | binary value          |
-| Json            | JavaScript JSON value                             | decoded JSON value    |
+| Type            | ORM                                                  | Decoded native YQL    |
+| --------------- | ---------------------------------------------------- | --------------------- |
+| Utf8            | `string`                                             | `string`              |
+| Bool            | `boolean`                                            | `boolean`             |
+| Int32           | `number`                                             | `number`              |
+| Int64 / Uint64  | `bigint`                                             | `bigint`              |
+| Double          | finite `number`                                      | `number`              |
+| Timestamp       | DateTime: JS `Date`; Timestamp: six-digit UTC string | `bigint` microseconds |
+| Date            | `YYYY-MM-DD` string                                  | JS `Date`             |
+| Decimal         | exact decimal string; ORM default `Decimal(22,9)`    | exact decimal string  |
+| String (binary) | `Uint8Array`                                         | binary value          |
+| Json            | JavaScript JSON value                                | decoded JSON value    |
 
 Converting large Int64 or Decimal values through `Number` can lose precision.
 `JSON.stringify` needs an application-defined conversion for bigint values.
-ORM Date results do not preserve YDB microseconds. Use `valueMode: 'wire'` for
+ORM `DateTime` results do not preserve YDB microseconds. Use schema `Timestamp`
+or native values for exact precision. Use `valueMode: 'wire'` for
 unmodified protobuf values and types, including types without a supported
 JavaScript projection.
 
 The runtime exports `Text`, `Bool`, numeric classes, `Timestamp`, `Optional`,
 `List`, `Struct`, `DecimalValue` and other typed values. See the public
-`prisma-ydb/runtime` declarations for the complete list. Contract array columns
-are unsupported; native YQL list/struct parameters are available.
+`prisma-ydb/runtime` declarations for the complete list. Contract lists store
+Json arrays; native YQL list/struct parameters are also available.
 
 ## Buffering and streaming
 

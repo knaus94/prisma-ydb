@@ -155,7 +155,7 @@ function jsonProjection(
 ): string {
   const rendered = context.expr(projection.value);
   if (projection.kind !== 'codec') return rendered;
-  if (projection.codec.many) unsupported('stored scalar-list JSON projections');
+  if (projection.codec.many) return rendered;
   switch (projection.codec.codecId) {
     case 'ydb/utf8@1':
     case 'ydb/int32@1':
@@ -167,6 +167,8 @@ function jsonProjection(
     case 'ydb/uint64@1':
     case 'ydb/number@1':
     case 'ydb/decimal@1':
+    case 'ydb/date@1':
+    case 'ydb/timestamp-us@1':
       return `CAST(${rendered} AS Utf8)`;
     case 'ydb/timestamp@1':
       return `CAST(DateTime::Format("%Y-%m-%dT%H:%M:%SZ")(${rendered}) AS Utf8)`;

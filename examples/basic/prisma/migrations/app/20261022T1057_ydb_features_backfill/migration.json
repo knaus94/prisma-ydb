@@ -1,0 +1,7 @@
+{
+  "from": "188f82da8b88da5ab6bb5f3e9acb9d73a9976a0c9fd9c735c0de4e03af56ae28",
+  "to": "d9b5980c8a70b67e8af44c665c7d0a58fb6a64e1d978fabe0e89c4e26830c04b",
+  "providedInvariants": ["ydb:data:data.Task.backfill_updatedAt"],
+  "createdAt": "2026-10-22T10:57:24.958Z",
+  "migrationHash": "d467447572efe7e46909c62b490c643111ca06356cc109b414ed412d56e54ca7"
+}

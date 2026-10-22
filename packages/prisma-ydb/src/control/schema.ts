@@ -17,12 +17,21 @@ import { Type_PrimitiveTypeId, type Type } from '@ydbjs/api/value';
 import { ydbTableExists } from '../driver/scheme.js';
 import { decodeValue } from '../driver/values.js';
 import { decimalText } from '../runtime/decimal.js';
+import { yqlTypeForCodec } from '../runtime/codecs.js';
+import {
+  dateText,
+  timestampText,
+  timestampFromMicros,
+} from '../runtime/temporal.js';
 import type { Driver } from '@ydbjs/core';
 import type {
   Contract,
   ColumnDefault,
 } from '@prisma/orm-framework/contract/types';
-import { diffSchemas } from '@prisma/orm-framework/components/control';
+import {
+  diffSchemas,
+  type DiffableNode,
+} from '@prisma/orm-framework/components/control';
 import type { TargetBoundComponentDescriptor } from '@prisma/orm-framework/components/components';
 import {
   contractToSchemaIR,
@@ -40,7 +49,28 @@ import {
   quoteYdbIdentifier,
   validateYdbContract,
   YDB_CONTROL_TABLES,
+  ydbTtlEntries,
+  ydbCreateNamespace,
+  type YdbTtl,
 } from './contract.js';
+
+export function ydbTableTtl(table: SqlTableIR): YdbTtl | undefined {
+  return (table.annotations?.['ydb'] as { ttl?: YdbTtl } | undefined)?.ttl;
+}
+
+class YdbTableIR extends SqlTableIR {
+  override isEqualTo(other: DiffableNode): boolean {
+    const expected = ydbTableTtl(this);
+    const actual = other instanceof SqlTableIR ? ydbTableTtl(other) : undefined;
+    return (
+      other instanceof SqlTableIR &&
+      super.isEqualTo(other) &&
+      expected?.table === actual?.table &&
+      expected?.column === actual?.column &&
+      expected?.expireAfterSeconds === actual?.expireAfterSeconds
+    );
+  }
+}
 
 export const CONTROL_TABLES = YDB_CONTROL_TABLES;
 
@@ -210,6 +240,9 @@ export function renderYdbLiteral(value: unknown, type: string): string {
     return `${type}(${JSON.stringify(encoded)})`;
   }
   if (value === null) return 'NULL';
+  if (type === 'Date') return `Date(${JSON.stringify(dateText(value))})`;
+  if (type === 'Timestamp')
+    return `Timestamp(${JSON.stringify(timestampText(value))})`;
   const decimal = /^Decimal\((\d+),\s*(\d+)\)$/.exec(type);
   if (decimal) {
     const precision = Number(decimal[1]);
@@ -243,9 +276,13 @@ function tableToSchema(name: string, table: DescribeTableResult): SqlTableIR {
     throw new Error(
       `YDB temporary or column-oriented table ${name} is not supported by the row-table migration model.`,
     );
-  if (table.ttlSettings?.mode.case || table.tiering)
+  if (
+    (table.ttlSettings?.mode.case &&
+      table.ttlSettings.mode.case !== 'dateTypeColumn') ||
+    table.tiering
+  )
     throw new Error(
-      `YDB table ${name} has TTL/tiering semantics which this contract cannot preserve. Native expiry policy must be modeled before schema signing or migration.`,
+      `YDB table ${name} uses unsupported numeric TTL or tiering; only temporal-column TTL is supported.`,
     );
   for (const index of table.indexes) {
     if (index.status !== TableIndexDescription_Status.READY)
@@ -275,13 +312,20 @@ function tableToSchema(name: string, table: DescribeTableResult): SqlTableIR {
           `SQL NULL and JSON null defaults need distinct contract literals (${name}.${column.name}); SQL NULL JSON-column defaults cannot yet be inferred.`,
         );
       const js = decodeValue(literal.value, literal.type);
-      if (type === 'Timestamp' || type === 'String')
+      if (type === 'String')
         throw new Error(
           `Introspection of ${type} literal defaults needs a lossless contract literal syntax (${name}.${column.name}).`,
         );
       def = {
         kind: 'literal',
-        value: typeof js === 'bigint' ? js.toString() : js,
+        value:
+          type === 'Timestamp' && typeof js === 'bigint'
+            ? timestampFromMicros(js)
+            : type === 'Date'
+              ? dateText(js)
+              : typeof js === 'bigint'
+                ? js.toString()
+                : js,
       } as ColumnDefault;
     }
     columns[column.name] = {
@@ -295,8 +339,22 @@ function tableToSchema(name: string, table: DescribeTableResult): SqlTableIR {
       ...(def ? { default: rawDefault(def, type), resolvedDefault: def } : {}),
     };
   }
-  return new SqlTableIR({
+  const ttl = table.ttlSettings?.mode;
+  return new YdbTableIR({
     name,
+    ...(ttl?.case === 'dateTypeColumn'
+      ? {
+          annotations: {
+            ydb: {
+              ttl: {
+                table: name,
+                column: ttl.value.columnName,
+                expireAfterSeconds: Number(ttl.value.expireAfterSeconds),
+              } satisfies YdbTtl,
+            },
+          },
+        }
+      : {}),
     columns,
     primaryKey: { columns: table.primaryKey },
     foreignKeys: [],
@@ -365,10 +423,90 @@ export function ydbContractToSchema(
 ): SqlSchemaIR {
   if (contract) validateYdbContract(contract);
   const types = sqlTypeLookupsOf(components);
-  return contractToSchemaIR(contract, {
+  const ttlByTable = new Map(
+    contract
+      ? Object.values(contract.storage.namespaces).flatMap((namespace) =>
+          Object.values(ydbTtlEntries(namespace)).map(
+            (ttl) => [ttl.table, ttl] as const,
+          ),
+        )
+      : [],
+  );
+  const physicalContract = contract && {
+    ...contract,
+    storage: {
+      ...contract.storage,
+      namespaces: Object.fromEntries(
+        Object.entries(contract.storage.namespaces).map(([id, namespace]) => [
+          id,
+          ydbCreateNamespace({
+            id,
+            entries: {
+              ...namespace.entries,
+              table: Object.fromEntries(
+                Object.entries(namespace.entries.table ?? {}).map(
+                  ([name, table]) => [name, { ...table, foreignKeys: [] }],
+                ),
+              ),
+            },
+          }),
+        ]),
+      ),
+    },
+  };
+  const schema = contractToSchemaIR(physicalContract, {
     annotationNamespace: 'ydb',
     ...types,
-    renderDefault: (def, _column, type) => rawDefault(def, type.baseTypeName),
+    renderDefault: (def, column, type) =>
+      rawDefault(
+        def,
+        column.many
+          ? 'Json'
+          : column.codecId === 'ydb/decimal@1'
+            ? yqlTypeForCodec(column.codecId, column.typeParams)
+            : type.baseTypeName,
+      ),
+  });
+  return new SqlSchemaIR({
+    ...schema,
+    tables: Object.fromEntries(
+      Object.entries(schema.tables).map(([name, table]) => [
+        name,
+        new YdbTableIR({
+          ...table,
+          ...(() => {
+            const ttl = ttlByTable.get(name);
+            return ttl
+              ? { annotations: { ...table.annotations, ydb: { ttl } } }
+              : {};
+          })(),
+          columns: Object.fromEntries(
+            Object.entries(table.columns).map(([columnName, column]) => {
+              const ref = column.codecRef;
+              const nativeType = column.many
+                ? 'Json'
+                : ref
+                  ? yqlTypeForCodec(ref.codecId, ref.typeParams)
+                  : column.nativeType;
+              return [
+                columnName,
+                {
+                  ...column,
+                  nativeType,
+                  resolvedNativeType: nativeType,
+                  many: false,
+                  codecRef: ref,
+                  codecBaseNativeType: column.codecBaseNativeType,
+                  dataType: column.dataType,
+                  authoredDefault: column.authoredDefault,
+                  toCanonicalForm: column.toCanonicalForm,
+                },
+              ];
+            }),
+          ),
+        }),
+      ]),
+    ),
   });
 }
 

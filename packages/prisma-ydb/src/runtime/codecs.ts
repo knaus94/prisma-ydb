@@ -2,7 +2,10 @@ import {
   CodecDescriptorImpl,
   CodecImpl,
   dataTypeId,
+  renderTsLiteral,
   type CodecTrait,
+  type AnyCodecDescriptor,
+  type Codec,
 } from '@prisma/orm-framework/components/codec';
 import { sqlDataType } from '@prisma/orm-family-sql/contract/data-type';
 import type { JsonValue } from '@prisma/orm-framework/contract/types';
@@ -16,9 +19,22 @@ import {
   Json,
   Text,
   Timestamp,
+  Date as YdbDate,
   Uint64,
 } from '@ydbjs/value/primitive';
 import { DecimalValue, decimalText } from './decimal.js';
+import { ydbJsonForm } from '../driver/json-form.js';
+export { ydbJsonForm } from '../driver/json-form.js';
+import {
+  dateText,
+  timestampText,
+  timestampFromMicros,
+  TimestampMicrosValue,
+} from './temporal.js';
+
+export class YdbJsonElement {
+  constructor(readonly value: JsonValue) {}
+}
 
 type Conversion<T> = {
   read(value: unknown): T;
@@ -26,6 +42,7 @@ type Conversion<T> = {
   wire(value: T): Value;
   json(value: T): JsonValue;
   fromJson(value: JsonValue): T;
+  literal?(value: JsonValue): string | undefined;
 };
 
 class YdbCodec<
@@ -34,15 +51,20 @@ class YdbCodec<
   T,
 > extends CodecImpl<Id, Traits, unknown, T> {
   constructor(
-    descriptor: YdbCodecDescriptor<Id, Traits, T>,
+    descriptor: AnyCodecDescriptor & { codecId: Id; traits: Traits },
     private readonly conversion: Conversion<T>,
   ) {
     super(descriptor);
   }
   async encode(value: T): Promise<Value> {
-    return this.conversion.wire(this.conversion.read(value));
+    const read = this.conversion.read(value);
+    return Object.assign(this.conversion.wire(read), {
+      [ydbJsonForm]: () => this.conversion.json(read),
+    });
   }
   async decode(value: unknown): Promise<T> {
+    if (value instanceof YdbJsonElement)
+      return this.conversion.fromJson(value.value);
     return (this.conversion.decode ?? this.conversion.read)(value);
   }
   encodeJson(value: T): JsonValue {
@@ -74,6 +96,9 @@ export class YdbCodecDescriptor<
   override renderOutputType(): string {
     return this.outputType;
   }
+  override readonly renderValueLiteral = (
+    value: JsonValue,
+  ): string | undefined => this.conversion.literal?.(value);
   factory() {
     return () => new YdbCodec(this, this.conversion);
   }
@@ -183,6 +208,8 @@ export const ydbUtf8 = new YdbCodecDescriptor(
     wire: (value: string) => new Text(value),
     json: assertString,
     fromJson: assertString,
+    literal: (value) =>
+      typeof value === 'string' ? renderTsLiteral(value) : undefined,
   },
   'string',
 );
@@ -303,18 +330,93 @@ export const ydbString = new YdbCodecDescriptor(
   },
   'Uint8Array',
 );
-export const ydbDecimal = new YdbCodecDescriptor(
-  'ydb/decimal@1',
-  numeric,
-  'Decimal(22,9)',
+export const ydbDate = new YdbCodecDescriptor(
+  'ydb/date@1',
+  ['equality', 'order'] as const,
+  'Date',
   {
-    read: (value) => decimalText(value, 22, 9),
-    wire: (value: string) => new DecimalValue(value),
-    json: (value) => decimalText(value, 22, 9),
-    fromJson: (value) => decimalText(value, 22, 9),
+    read: dateText,
+    decode: (value) => dateText(value),
+    wire: (value) => new YdbDate(new Date(`${value}T00:00:00.000Z`)),
+    json: dateText,
+    fromJson: dateText,
   },
   'string',
 );
+export const ydbTimestampUs = new YdbCodecDescriptor(
+  'ydb/timestamp-us@1',
+  ['equality', 'order'] as const,
+  'Timestamp',
+  {
+    read: timestampText,
+    decode: (value) =>
+      typeof value === 'bigint'
+        ? timestampFromMicros(value)
+        : timestampText(value),
+    wire: (value: string) => new TimestampMicrosValue(value),
+    json: timestampText,
+    fromJson: timestampText,
+  },
+  'string',
+  'ydb/timestamp',
+);
+
+export function decimalParams(value: unknown = {}): {
+  precision: number;
+  scale: number;
+} {
+  if (typeof value !== 'object' || value === null || Array.isArray(value))
+    throw new TypeError('Decimal parameters must be an object');
+  const params = value as Record<string, unknown>;
+  if (Object.hasOwn(params, 'precision') !== Object.hasOwn(params, 'scale'))
+    throw new TypeError('Decimal requires both precision and scale');
+  if (Object.keys(params).some((key) => key !== 'precision' && key !== 'scale'))
+    throw new TypeError('Unknown Decimal parameter');
+  const precision = params['precision'] ?? 22;
+  const scale = params['scale'] ?? 9;
+  if (typeof precision !== 'number' || typeof scale !== 'number')
+    throw new TypeError('Decimal precision and scale must be numbers');
+  decimalText('0', precision, scale);
+  return { precision, scale };
+}
+
+class YdbDecimalDescriptor extends CodecDescriptorImpl<{
+  precision?: number;
+  scale?: number;
+}> {
+  readonly codecId = 'ydb/decimal@1';
+  readonly traits = numeric;
+  readonly dataType = dataTypeId('ydb/decimal');
+  readonly yqlType = 'Decimal(22,9)';
+  readonly paramsSchema = {
+    '~standard': {
+      version: 1 as const,
+      vendor: 'prisma-ydb',
+      validate(value: unknown) {
+        try {
+          return { value: decimalParams(value) };
+        } catch (error) {
+          return { issues: [{ message: String(error) }] };
+        }
+      },
+    },
+  };
+  override renderOutputType() {
+    return 'string';
+  }
+  factory(params: { precision?: number; scale?: number } = {}) {
+    const { precision, scale } = decimalParams(params);
+    const read = (value: unknown) => decimalText(value, precision, scale);
+    return () =>
+      new YdbCodec(this, {
+        read,
+        wire: (value: string) => new DecimalValue(value, precision, scale),
+        json: read,
+        fromJson: read,
+      });
+  }
+}
+export const ydbDecimal = new YdbDecimalDescriptor();
 
 export const ydbCodecDescriptors = [
   ydbUtf8,
@@ -325,6 +427,8 @@ export const ydbCodecDescriptors = [
   ydbBool,
   ydbDouble,
   ydbTimestamp,
+  ydbDate,
+  ydbTimestampUs,
   ydbJson,
   ydbString,
   ydbDecimal,
@@ -348,11 +452,25 @@ export const ydbScalarDescriptors = {
   Boolean: ydbBool,
   Float: ydbDouble,
   DateTime: ydbTimestamp,
+  Date: ydbDate,
+  Timestamp: ydbTimestampUs,
   Json: ydbJson,
   Bytes: ydbString,
   Decimal: ydbDecimal,
 } as const;
 export type CodecTypes = {
+  readonly 'ydb/date@1': {
+    input: string | Date;
+    output: string;
+    json: string;
+    traits: 'equality' | 'order';
+  };
+  readonly 'ydb/timestamp-us@1': {
+    input: string | Date;
+    output: string;
+    json: string;
+    traits: 'equality' | 'order';
+  };
   readonly 'ydb/utf8@1': {
     input: string;
     output: string;
@@ -424,9 +542,32 @@ export type CodecTypes = {
 const codecsById = new Map<string, (typeof ydbCodecDescriptors)[number]>(
   ydbCodecDescriptors.map((codec) => [codec.codecId, codec]),
 );
+const jsonCodecsById = new Map<string, Codec>(
+  ydbCodecDescriptors
+    .filter((descriptor) => descriptor !== ydbDecimal)
+    .map((descriptor) => [descriptor.codecId, descriptor.factory()()] as const),
+);
 
-export function yqlTypeForCodec(codecId: string): string {
+export function yqlTypeForCodec(codecId: string, typeParams?: unknown): string {
+  if (codecId === 'ydb/decimal@1') {
+    const { precision, scale } = decimalParams(typeParams);
+    return `Decimal(${precision},${scale})`;
+  }
   const codec = codecsById.get(codecId);
   if (!codec) throw new TypeError(`YDB codec not registered: ${codecId}`);
   return codec.yqlType;
+}
+
+export function encodeYdbJson(
+  codecId: string,
+  value: unknown,
+  typeParams?: unknown,
+): JsonValue {
+  if (codecId === ydbDecimal.codecId) {
+    const { precision, scale } = decimalParams(typeParams);
+    return decimalText(value, precision, scale);
+  }
+  const codec = jsonCodecsById.get(codecId);
+  if (!codec) throw new TypeError(`YDB codec not registered: ${codecId}`);
+  return codec.encodeJson(value as never);
 }

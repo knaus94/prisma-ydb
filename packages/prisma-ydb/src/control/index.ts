@@ -10,6 +10,7 @@ export {
   YdbNamespace,
   ydbCreateNamespace,
   validateYdbContract,
+  type YdbTtl,
 } from './contract.js';
 export { YdbControlDriver, ydbControlDriverDescriptor } from './driver.js';
 export { YdbControlAdapter } from './adapter.js';

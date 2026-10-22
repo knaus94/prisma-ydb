@@ -1,13 +1,13 @@
 # Releasing
 
-Prepared package: `prisma-ydb@0.1.0-rc.0`. Nothing has been published by this task.
-Registry name availability does not establish ownership; verify publishing rights
-before first release. A different name also requires updating generated imports
-in `runtime/descriptors.ts`, `control/config.ts` and `control/planner.ts`.
+Published as `prisma-ydb` on npm; prereleases use the `next` dist-tag. Verify
+publishing rights before a release. A different name also requires updating
+generated imports in `runtime/descriptors.ts`, `control/config.ts` and
+`control/planner.ts`.
 
 ```bash
 yarn install --immutable
-yarn release:version 0.1.0-rc.1
+yarn release:version 0.1.0-rc.2
 # Update CHANGELOG.md and review version/lockfile changes.
 yarn check
 yarn package:pack
@@ -36,8 +36,8 @@ and environment `npm`. Initial package creation uses an authorized local login.
 
 The workflow uses `id-token: write` and provenance; no registry token is committed.
 Configure the GitHub environment's release rules before enabling publication.
-This local project has no fabricated repository URL or remote. Account-specific
-hosted publishing configuration remains necessary.
+The repository is `github.com/knaus94/prisma-ydb`. Account-specific hosted
+publishing configuration (npm trusted publisher, `npm` environment) remains necessary.
 
 References: [npm publish](https://docs.npmjs.com/cli/v11/commands/npm-publish/),
 [lifecycle hooks](https://docs.npmjs.com/cli/v11/using-npm/scripts/),

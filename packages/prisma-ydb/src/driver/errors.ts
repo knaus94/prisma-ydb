@@ -4,6 +4,7 @@ import {
 } from '@prisma/orm-family-sql/errors';
 import { StatusIds_StatusCode as Status } from '@ydbjs/api/operation';
 import { YDBError } from '@ydbjs/error';
+import { runtimeError } from '@prisma/orm-framework/components/runtime';
 
 /** Server issue messages may contain query text/data, so errors expose status only. */
 export class YdbQueryError extends SqlQueryError {
@@ -70,11 +71,18 @@ export function normalizeError(
   if (error instanceof YDBError) {
     const issueCodes: number[] = [];
     let uniqueViolation = false;
+    let referentialViolation = false;
     const visit = (issues: readonly unknown[]): void => {
       for (const issue of issues) {
         if (typeof issue !== 'object' || issue === null) continue;
         if ('issueCode' in issue && typeof issue.issueCode === 'number')
           issueCodes.push(issue.issueCode);
+        if (
+          'message' in issue &&
+          typeof issue.message === 'string' &&
+          /(?:^|\n)YDB\.REFERENTIAL_ACTION(?:\n|$)/.test(issue.message)
+        )
+          referentialViolation = true;
         // 2012 is KIKIMR_CONSTRAINT_VIOLATION, which also covers non-unique
         // constraints. Only this observed native duplicate-key leaf is safe to
         // expose as Prisma's unique violation; PRECONDITION_FAILED alone is not.
@@ -90,6 +98,11 @@ export function normalizeError(
       }
     };
     visit(error.issues);
+    if (error.code === Status.PRECONDITION_FAILED && referentialViolation)
+      return runtimeError(
+        'YDB.REFERENTIAL_ACTION',
+        'A YDB relation requires an existing parent or prevents changing a referenced parent',
+      );
     return new YdbQueryError(
       error.code,
       operation,

@@ -1,0 +1,121 @@
+[
+  {
+    "id": "table.Task.0",
+    "label": "ALTER TABLE `Task` ADD COLUMN `status` Utf8 NOT NULL DEFAULT Utf8(\"TODO\")",
+    "operationClass": "additive",
+    "target": {
+      "id": "ydb",
+      "details": {
+        "table": "Task"
+      }
+    },
+    "precheck": [],
+    "execute": [
+      {
+        "description": "ALTER TABLE `Task` ADD COLUMN `status` Utf8 NOT NULL DEFAULT Utf8(\"TODO\")",
+        "sql": "ALTER TABLE `Task` ADD COLUMN `status` Utf8 NOT NULL DEFAULT Utf8(\"TODO\")"
+      }
+    ],
+    "postcheck": [],
+    "meta": {
+      "ydbBefore": {
+        "columns": {
+          "createdAt": {
+            "type": "Timestamp",
+            "nullable": false,
+            "default": null
+          },
+          "done": {
+            "type": "Bool",
+            "nullable": false,
+            "default": {
+              "kind": "literal",
+              "value": false
+            }
+          },
+          "id": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          },
+          "projectId": {
+            "type": "Utf8",
+            "nullable": true,
+            "default": null
+          },
+          "title": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          }
+        },
+        "primaryKey": [
+          "id"
+        ],
+        "indexes": [
+          {
+            "name": "Task_projectId_idx_a96e4d92",
+            "columns": [
+              "projectId"
+            ],
+            "unique": false
+          }
+        ],
+        "uniques": []
+      },
+      "ydbAfter": {
+        "columns": {
+          "createdAt": {
+            "type": "Timestamp",
+            "nullable": false,
+            "default": null
+          },
+          "done": {
+            "type": "Bool",
+            "nullable": false,
+            "default": {
+              "kind": "literal",
+              "value": false
+            }
+          },
+          "id": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          },
+          "projectId": {
+            "type": "Utf8",
+            "nullable": true,
+            "default": null
+          },
+          "title": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": null
+          },
+          "status": {
+            "type": "Utf8",
+            "nullable": false,
+            "default": {
+              "kind": "literal",
+              "value": "TODO"
+            }
+          }
+        },
+        "primaryKey": [
+          "id"
+        ],
+        "indexes": [
+          {
+            "name": "Task_projectId_idx_a96e4d92",
+            "columns": [
+              "projectId"
+            ],
+            "unique": false
+          }
+        ],
+        "uniques": []
+      }
+    }
+  }
+]

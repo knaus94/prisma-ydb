@@ -8,7 +8,7 @@ import { ydbCreateNamespace, type YdbNamespace } from './contract.js';
  * PSL authoring hook: keep ORM relations and lookup indexes, but do not put
  * unsupported SQL foreign keys into YDB's physical schema. Used only when
  * application-managed relations are explicitly selected in the CLI config.
- * Deserialization deliberately keeps using the strict namespace factory.
+ * Action-bearing keys are client metadata; keys without actions stay absent.
  */
 export function ydbCreateApplicationRelationsNamespace(
   input: SqlNamespaceInput,
@@ -18,14 +18,24 @@ export function ydbCreateApplicationRelationsNamespace(
     Object.entries(namespace.table).map(([name, table]) => {
       if (table.foreignKeys.length === 0) return [name, table];
       for (const key of table.foreignKeys) {
-        // Never silently discard requested cascades or constraint checks.
-        if (key.onDelete !== undefined || key.onUpdate !== undefined) {
+        if (
+          (key.onDelete !== undefined || key.onUpdate !== undefined) &&
+          (key.onDelete === undefined || key.onDelete === 'noAction') &&
+          (key.onUpdate === undefined || key.onUpdate === 'noAction')
+        )
           throw new Error(
-            `YDB application relations do not enforce onDelete/onUpdate (${name}). Remove the referential action and implement it explicitly in a transaction.`,
+            `YDB client-side NoAction is equivalent to Restrict (${name}). Declare onDelete: Restrict (or Cascade/SetNull) to opt in to enforcement; omit referential actions to keep the relation unenforced. Prisma 8 canonicalization omits NoAction-only metadata.`,
           );
-        }
       }
-      return [name, new StorageTable({ ...table, foreignKeys: [] })];
+      return [
+        name,
+        new StorageTable({
+          ...table,
+          foreignKeys: table.foreignKeys.filter(
+            (key) => key.onDelete !== undefined || key.onUpdate !== undefined,
+          ),
+        }),
+      ];
     }),
   );
   return ydbCreateNamespace({

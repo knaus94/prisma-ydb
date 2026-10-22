@@ -27,12 +27,13 @@ import {
   type CodecTypes,
 } from './codecs.js';
 import { compileYql, unsupported } from './compiler.js';
+import { ydbQueryOperations } from './operations.js';
 
 export const ydbCapabilities = {
   sql: {
     returning: true,
-    enums: false,
-    scalarList: false,
+    enums: false, // Enum metadata/types are supported; YDB does not enforce value sets.
+    scalarList: true,
     defaultInInsert: false,
     lateral: false,
     checkConstraint: false,
@@ -202,6 +203,13 @@ export const ydbRuntimeAdapter: SqlRuntimeAdapterDescriptor<'ydb'> = {
   capabilities: ydbCapabilities,
   types: {
     aggregateDescriptors: ydbAggregateDescriptors,
+    queryOperationTypes: {
+      import: {
+        package: 'prisma-ydb/runtime',
+        named: 'QueryOperationTypes',
+        alias: 'YdbQueryOperationTypes',
+      },
+    },
     codecTypes: {
       codecDescriptors: ydbCodecDescriptors,
       import: {
@@ -213,6 +221,7 @@ export const ydbRuntimeAdapter: SqlRuntimeAdapterDescriptor<'ydb'> = {
   },
   codecs: () => ydbCodecDescriptors,
   rawCodecInferer: ydbRawCodecInferer,
+  queryOperations: () => ydbQueryOperations,
   mutationDefaultGenerators: () => [
     ...builtinGeneratorIds.map(
       (id): RuntimeMutationDefaultGenerator => ({

@@ -1,9 +1,12 @@
-import type { Contract } from '@prisma/orm-framework/contract/types';
+import {
+  CrossReferenceSchema,
+  type Contract,
+} from '@prisma/orm-framework/contract/types';
 import {
   UNBOUND_NAMESPACE_ID,
   hydrateNamespaceEntities,
 } from '@prisma/orm-framework/components/ir';
-import { tableEntityKind } from '@prisma/orm-family-sql/contract/entity-kinds';
+import { composeSqlEntityKinds } from '@prisma/orm-family-sql/contract/entity-kinds';
 import { SqlContractSerializerBase } from '@prisma/orm-family-sql/family/ir';
 import {
   SqlNamespaceBase,
@@ -19,6 +22,72 @@ export const YDB_CONTROL_TABLES: ReadonlySet<string> = new Set([
   '_prisma_ydb_migrations',
   '_prisma_ydb_lock',
 ]);
+
+export interface YdbTtl {
+  readonly table: string;
+  readonly column: string;
+  readonly expireAfterSeconds: number;
+}
+
+export const YDB_TEMPORAL_CODECS: ReadonlySet<string> = new Set([
+  'ydb/timestamp@1',
+  'ydb/timestamp-us@1',
+  'ydb/date@1',
+]);
+
+export function ydbDurationSeconds(value: string): number {
+  const match = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(
+    value,
+  );
+  if (
+    !match ||
+    !match.slice(1).some((part) => part !== undefined) ||
+    value.endsWith('T')
+  )
+    throw new Error(
+      'TTL expireAfter must be a non-empty ISO-8601 duration with whole days, hours, minutes or seconds.',
+    );
+  const seconds =
+    Number(match[1] ?? 0) * 86400 +
+    Number(match[2] ?? 0) * 3600 +
+    Number(match[3] ?? 0) * 60 +
+    Number(match[4] ?? 0);
+  if (!Number.isSafeInteger(seconds) || seconds > 9223372036854)
+    throw new Error('TTL expireAfter exceeds the YDB Interval range.');
+  return seconds;
+}
+
+export const ydbDuration = (seconds: number): string => `PT${seconds}S`;
+
+const ttlKind = {
+  kind: 'ttl',
+  schema: CrossReferenceSchema.or('unknown').narrow((value, ctx) => {
+    if (typeof value !== 'object' || value === null)
+      return ctx.mustBe('a YDB TTL policy');
+    const ttl = value as Record<string, unknown>;
+    return (
+      (typeof ttl['table'] === 'string' &&
+        typeof ttl['column'] === 'string' &&
+        typeof ttl['expireAfterSeconds'] === 'number' &&
+        Number.isSafeInteger(ttl['expireAfterSeconds']) &&
+        ttl['expireAfterSeconds'] >= 0 &&
+        ttl['expireAfterSeconds'] <= 9223372036854 &&
+        Object.keys(ttl).every((key) =>
+          ['table', 'column', 'expireAfterSeconds'].includes(key),
+        )) ||
+      ctx.mustBe('a canonical YDB TTL policy')
+    );
+  }),
+  construct: (input: YdbTtl): YdbTtl => Object.freeze({ ...input }),
+};
+
+const ydbEntityKinds = composeSqlEntityKinds([ttlKind]);
+
+export function ydbTtlEntries(namespace: {
+  readonly entries: SqlNamespaceEntries;
+}): Readonly<Record<string, YdbTtl>> {
+  return (namespace.entries['ttl'] ?? {}) as Readonly<Record<string, YdbTtl>>;
+}
 
 /** Quote an identifier, including a database-relative table path. */
 export function quoteYdbIdentifier(value: string): string {
@@ -50,8 +119,9 @@ export class YdbNamespace extends SqlNamespaceBase {
     this.entries = Object.freeze(
       hydrateNamespaceEntities(
         input.entries,
-        new Map([['table', tableEntityKind]]),
+        ydbEntityKinds,
         'fail',
+        input.id,
       ) as SqlNamespaceEntries,
     );
     Object.freeze(this);
@@ -74,6 +144,9 @@ export const ydbCreateNamespace = (input: SqlNamespaceInput): YdbNamespace =>
 export class YdbContractSerializer extends SqlContractSerializerBase<
   Contract<SqlStorage>
 > {
+  constructor() {
+    super(undefined, [ttlKind]);
+  }
   override deserializeContract<T extends Contract = Contract<SqlStorage>>(
     json: unknown,
   ): T {
@@ -110,20 +183,38 @@ export function validateYdbContract(contract: Contract<SqlStorage>): void {
         );
       if (!table.primaryKey || table.primaryKey.columns.length === 0)
         throw new Error(`YDB table ${name} requires a primary key.`);
-      if (table.foreignKeys.length > 0)
-        throw new Error(
-          `YDB does not enforce foreign keys (${name}); set relationMode: 'application' in defineYdbConfig for PSL, or constraint: false in the TypeScript builder. The application must enforce referential integrity.`,
-        );
+      for (const key of table.foreignKeys) {
+        if (key.onDelete === undefined && key.onUpdate === undefined)
+          throw new Error(
+            `YDB does not enforce foreign keys (${name}); set relationMode: 'application' in defineYdbConfig for PSL, or constraint: false in the TypeScript builder. Retained client-side foreign keys must declare onDelete or onUpdate.`,
+          );
+        if (
+          key.onDelete === 'setDefault' ||
+          (key.onUpdate !== undefined &&
+            key.onUpdate !== 'noAction' &&
+            key.onUpdate !== 'restrict')
+        )
+          throw new Error(
+            `YDB referential actions reject SetDefault and onUpdate other than NoAction/Restrict (${name}).`,
+          );
+        if (
+          key.onDelete === 'setNull' &&
+          key.source.columns.some((column) => !table.columns[column]?.nullable)
+        )
+          throw new Error(
+            `YDB SetNull requires nullable child foreign-key columns (${name}).`,
+          );
+      }
       if ((table.checks?.length ?? 0) > 0)
         throw new Error(`YDB CHECK constraints are not supported (${name}).`);
       for (const [columnName, column] of Object.entries(table.columns)) {
         if (
           column.default?.kind === 'literal' &&
-          (column.codecId === 'ydb/timestamp@1' ||
-            column.codecId === 'ydb/string@1')
+          !column.many &&
+          column.codecId === 'ydb/string@1'
         ) {
           throw new Error(
-            `Timestamp and byte-string storage defaults need a lossless contract literal round trip (${name}.${columnName}); supply the value explicitly.`,
+            `Byte-string storage defaults need a lossless contract literal round trip (${name}.${columnName}); supply the value explicitly.`,
           );
         }
         if (
@@ -135,9 +226,13 @@ export function validateYdbContract(contract: Contract<SqlStorage>): void {
             `YDB serial columns must participate in the primary key (${name}.${columnName}).`,
           );
         }
-        if (column.many)
+        if (column.many && column.codecId === 'ydb/json@1')
           throw new Error(
-            `YDB table columns cannot store SQL arrays (${name}.${columnName}). Store structured data as Json.`,
+            `YDB Json[] columns are unsupported (${name}.${columnName}); use Json for structured arrays.`,
+          );
+        if (column.many && column.many.elementNullable)
+          throw new Error(
+            `YDB list elements cannot be nullable (${name}.${columnName}).`,
           );
         if (
           column.default?.kind === 'function' &&
@@ -155,7 +250,43 @@ export function validateYdbContract(contract: Contract<SqlStorage>): void {
           );
       }
     }
+    const policies = new Set<string>();
+    for (const ttl of Object.values(ydbTtlEntries(namespace))) {
+      const column = namespace.entries.table?.[ttl.table]?.columns[ttl.column];
+      if (!column || column.many || !YDB_TEMPORAL_CODECS.has(column.codecId))
+        throw new Error(
+          `YDB TTL requires a scalar temporal column (${ttl.table}.${ttl.column}).`,
+        );
+      if (policies.has(ttl.table))
+        throw new Error(
+          `Only one YDB TTL policy is allowed per table (${ttl.table}).`,
+        );
+      policies.add(ttl.table);
+    }
   }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (namespaceId: string, name: string): void => {
+    const id = JSON.stringify([namespaceId, name]);
+    if (visiting.has(id))
+      throw new Error(
+        'YDB Cascade cycles, including self-relations, are unsupported: recursive deletes require an acyclic static YQL program.',
+      );
+    if (visited.has(id)) return;
+    visiting.add(id);
+    const table =
+      contract.storage.namespaces[namespaceId]?.entries.table?.[name];
+    for (const key of table?.foreignKeys ?? [])
+      if (key.onDelete === 'cascade')
+        visit(key.target.namespaceId, key.target.tableName);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const [namespaceId, namespace] of Object.entries(
+    contract.storage.namespaces,
+  ))
+    for (const name of Object.keys(namespace.entries.table ?? {}))
+      visit(namespaceId, name);
 }
 
 export const ydbContractSerializer = new YdbContractSerializer();

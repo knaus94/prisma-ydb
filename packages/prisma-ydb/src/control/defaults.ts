@@ -4,6 +4,7 @@ import type {
   LoweredDefaultResult,
 } from '@prisma/orm-framework/components/control';
 import { builtinGeneratorRegistryMetadata } from '@prisma/orm-framework/ids';
+import { timestampNowControlDescriptor } from '@prisma/orm-framework/components/control';
 import { int, num, oneOf, optional } from '@prisma/orm-framework/psl-parser';
 
 const generator = (
@@ -90,14 +91,17 @@ export const ydbMutationDefaults: ControlMutationDefaults = {
             code: 'YDB.DEFAULT_FUNCTION_UNSUPPORTED',
             sourceId: context.sourceId,
             message:
-              'YDB supports literal column defaults only. Supply createdAt explicitly; database now() defaults cannot be represented faithfully.',
+              'YDB does not support @default(now()). Use temporal.createdAt() or temporal.updatedAt() for application-time timestamps.',
           },
         }),
       },
     ],
   ]),
-  generatorDescriptors: builtinGeneratorRegistryMetadata.map(({ id }) => ({
-    id,
-    applicableCodecIds: ['ydb/utf8@1'],
-  })),
+  generatorDescriptors: [
+    ...builtinGeneratorRegistryMetadata.map(({ id }) => ({
+      id,
+      applicableCodecIds: ['ydb/utf8@1'],
+    })),
+    timestampNowControlDescriptor(),
+  ],
 };

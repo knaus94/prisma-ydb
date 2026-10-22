@@ -11,6 +11,16 @@ import type {
   DataTypeAuthoringEntry,
   AuthoringTypeNamespace,
 } from '@prisma/orm-framework/components/authoring';
+import {
+  temporalAuthoringPresets,
+  temporalCodecPreset,
+  type AuthoringModelAttributeContext,
+} from '@prisma/orm-framework/components/authoring';
+import {
+  modelAttribute,
+  identifier,
+  str,
+} from '@prisma/orm-framework/psl-parser';
 import sql from '@prisma/orm-family-sql/family/control';
 import { prismaContract } from '@prisma/orm-family-sql/contract-psl/provider';
 import {
@@ -37,15 +47,21 @@ import {
   ydbAggregateDescriptors,
 } from '../runtime/descriptors.js';
 import type { YdbBinding } from '../driver/types.js';
-import { ydbContractSerializer, ydbCreateNamespace } from './contract.js';
+import {
+  ydbContractSerializer,
+  ydbCreateNamespace,
+  YDB_TEMPORAL_CODECS,
+  ydbDurationSeconds,
+} from './contract.js';
 import { ydbMutationDefaults } from './defaults.js';
+import { ydbQueryOperations } from '../runtime/operations.js';
 import { ydbControlDriverDescriptor } from './driver.js';
 import { YdbControlAdapter } from './adapter.js';
 import { diffYdbSchema, ydbContractToSchema } from './schema.js';
 import { YdbMigrationPlanner } from './planner.js';
 import { YdbMigrationRunner } from './runner.js';
 import { inferYdbPsl, printYdbPsl } from './psl.js';
-import { decimalText } from '../runtime/decimal.js';
+import { dateText, timestampText } from '../runtime/temporal.js';
 import { ydbCreateApplicationRelationsNamespace } from './relations.js';
 
 // SQL's Char/VarChar field presets require fixed-width semantics YDB Utf8 does not provide.
@@ -54,7 +70,61 @@ const ydbSqlFamily: typeof sql = Object.assign(Object.create(sql), {
   authoring: { ...sql.authoring, type: {}, field: {} },
 });
 
+const ttlAttribute = {
+  kind: 'modelAttribute' as const,
+  attribute: 'ttl',
+  spec: () =>
+    modelAttribute('ttl', {
+      documentation: 'Asynchronous row expiry.',
+      named: {
+        field: { type: identifier(), documentation: 'Temporal model field.' },
+        expireAfter: {
+          type: str(),
+          documentation: 'ISO-8601 expiry duration.',
+        },
+      },
+    }),
+  lower(
+    parsed: { field: string; expireAfter: string },
+    context: AuthoringModelAttributeContext,
+  ) {
+    try {
+      const column = context.fieldStorageName(parsed.field);
+      const codec = context.fieldCodecId(parsed.field);
+      if (!column || !codec || !YDB_TEMPORAL_CODECS.has(codec))
+        throw new Error(
+          `@@ttl requires a temporal field (${context.modelName}.${parsed.field}).`,
+        );
+      return {
+        key: context.storageName,
+        entity: {
+          table: context.storageName,
+          column,
+          expireAfterSeconds: ydbDurationSeconds(parsed.expireAfter),
+        },
+      };
+    } catch (error) {
+      context.diagnostics?.push({
+        code: 'YDB.TTL_INVALID',
+        message: error instanceof Error ? error.message : String(error),
+        sourceId: context.sourceId ?? '<ydb>',
+      });
+      return undefined;
+    }
+  },
+};
+
 const authoringDataTypes: Readonly<Record<string, DataTypeAuthoringEntry>> = {
+  'ydb/date': {
+    documentation: 'YDB calendar day in UTC.',
+    written: { kind: 'tag', tag: 'date', parse: dateText },
+    print: String,
+  },
+  'ydb/timestamp': {
+    documentation: 'YDB UTC timestamp.',
+    written: { kind: 'tag', tag: 'timestamp', parse: timestampText },
+    print: String,
+  },
   'ydb/utf8': {
     documentation: 'YDB Unicode text.',
     written: { kind: 'plain', syntax: 'string', parse: (text) => text },
@@ -94,11 +164,15 @@ const authoringDataTypes: Readonly<Record<string, DataTypeAuthoringEntry>> = {
     print: String,
   },
   'ydb/decimal': {
-    documentation: 'Fixed-precision Decimal(22,9).',
+    documentation: 'Exact fixed-precision decimal.',
     written: {
       kind: 'tag',
       tag: 'decimal',
-      parse: (value) => decimalText(value, 22, 9),
+      parse: (value) => {
+        if (!/^-?\d+(?:\.\d+)?$/.test(value))
+          throw new TypeError('Expected an exact decimal string');
+        return value;
+      },
     },
     print: String,
   },
@@ -115,8 +189,38 @@ const types = Object.fromEntries(
       name,
       {
         kind: 'typeConstructor',
-        inferred: true,
-        output: { codecId: descriptor.codecId },
+        ...(name === 'Timestamp' ? {} : { inferred: true }),
+        ...(name === 'Decimal'
+          ? {
+              args: [
+                {
+                  kind: 'number',
+                  integer: true,
+                  minimum: 1,
+                  maximum: 35,
+                  optional: true,
+                },
+                {
+                  kind: 'number',
+                  integer: true,
+                  minimum: 0,
+                  maximum: 35,
+                  optional: true,
+                },
+              ],
+            }
+          : {}),
+        output: {
+          codecId: descriptor.codecId,
+          ...(name === 'Decimal'
+            ? {
+                typeParams: {
+                  precision: { kind: 'arg', index: 0 },
+                  scale: { kind: 'arg', index: 1 },
+                },
+              }
+            : {}),
+        },
       },
     ],
   ),
@@ -130,6 +234,7 @@ export const ydbControlTarget = {
   version: '0.0.1',
   defaultNamespaceId: UNBOUND_NAMESPACE_ID,
   supportsNamespaces: false,
+  queryOperations: () => ydbQueryOperations,
   contractSerializer: ydbContractSerializer,
   create: () => ({ familyId: 'sql' as const, targetId: 'ydb' as const }),
   classifySubjectGranularity: relationalNodeGranularity,
@@ -156,6 +261,7 @@ export const ydbControlTarget = {
     diffSchema: typeof diffYdbSchema;
     classifySubjectGranularity: typeof relationalNodeGranularity;
     classifyEntityKind: typeof relationalNodeEntityKind;
+    queryOperations: () => typeof ydbQueryOperations;
   };
 
 export const ydbControlAdapterDescriptor: ControlAdapterDescriptor<
@@ -179,10 +285,26 @@ export const ydbControlAdapterDescriptor: ControlAdapterDescriptor<
       },
     },
     aggregateDescriptors: ydbAggregateDescriptors,
+    queryOperationTypes: {
+      import: {
+        package: 'prisma-ydb/runtime',
+        named: 'QueryOperationTypes',
+        alias: 'YdbQueryOperationTypes',
+      },
+    },
   },
   dataTypes: ydbDataTypes,
   authoring: {
     type: types,
+    field: {
+      temporal: {
+        ...temporalAuthoringPresets({ codecId: 'ydb/timestamp@1' }),
+        DateTime: temporalCodecPreset({ codecId: 'ydb/timestamp@1' }),
+        Timestamp: temporalCodecPreset({ codecId: 'ydb/timestamp-us@1' }),
+        Date: temporalCodecPreset({ codecId: 'ydb/date@1' }),
+      },
+    },
+    modelAttributes: { ttl: ttlAttribute },
     valueObjectStorageType: 'Json',
     dataTypes: authoringDataTypes,
   },

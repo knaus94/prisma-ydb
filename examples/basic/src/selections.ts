@@ -4,10 +4,18 @@ import type { Contract } from './generated/contract.d.js';
 
 export function createSelections(orm: YdbClient<Contract>['orm']) {
   const project = orm.Project.fragment((projects) =>
-    projects.select('id', 'name'),
+    projects.select('id', 'name', 'budget', 'tags', 'settings'),
   );
   const task = orm.Task.fragment((tasks) =>
-    tasks.select('id', 'title', 'done', 'createdAt'),
+    tasks.select(
+      'id',
+      'title',
+      'done',
+      'status',
+      'dueOn',
+      'createdAt',
+      'updatedAt',
+    ),
   );
   const fullTask = orm.Task.fragment((tasks) =>
     tasks.with(task).include('project', (projects) => projects.with(project)),

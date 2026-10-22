@@ -1,22 +1,23 @@
 # Relations and referential integrity
 
 `@relation` describes how the ORM finds related rows and derives their types.
-**YDB does not enforce foreign keys.** Your application owns reference validation
-and deletion rules, including writes performed through raw YQL or other services.
+**YDB does not enforce foreign keys.** Action-bearing relations use client-side
+checks and deletion rules. Raw YQL and other applications bypass them.
 
 ## What each mechanism guarantees
 
 | Mechanism                         | Provides                                             | Does not provide                                    |
 | --------------------------------- | ---------------------------------------------------- | --------------------------------------------------- |
-| `@relation`                       | Field mappings, includes, relation filters and types | Validation that every stored reference has a parent |
+| `@relation` without actions       | Field mappings, includes, relation filters and types | Validation that every stored reference has a parent |
 | Required scalar, such as `String` | A `NOT NULL` column                                  | Validation that the referenced row exists           |
 | `@@index([projectId])`            | An index available for related-row lookups           | Referential integrity                               |
 | Unique index                      | Uniqueness of indexed keys                           | Validation of references to another table           |
 | `db.transaction()`                | Serializable execution of the operations you perform | Business checks you did not implement               |
 | TypeScript / DTO                  | Compile-time shape checking                          | Validation of the current database contents         |
 
-There is no global interceptor that validates every `*Id` field. A scalar write
-such as `Task.create({ projectId, ... })` can store a nonexistent parent ID.
+There is no global interceptor for arbitrary `*Id` fields. Reference checks apply
+only to relations declaring supported actions. Other scalar writes can store
+nonexistent parent IDs.
 
 ## Define a relation
 
@@ -41,8 +42,8 @@ model Task {
 ```
 
 Set `relationMode: 'application'` in `defineYdbConfig`. This explicitly enables
-relations whose integrity is managed by your application. It does not install
-automatic reference checks or deletion handlers.
+relations managed by the client. A relation without actions remains unenforced
+query metadata; action-bearing relations install the checks described below.
 
 `index: false` disables the relation's implicit index because this example
 already declares its index with `@@index([projectId])`.
@@ -60,17 +61,41 @@ flowchart TD
 
 The adapter uses Prisma's `createNamespace` authoring hook. It retains relation
 metadata and indexes while omitting physical FK constraints **before computing
-the contract hash**. Deserialization still rejects stored contracts containing
-physical FKs; it does not silently discard constraints from an existing artifact.
+the contract hash**. Action-bearing FKs remain ordinary contract metadata and
+are excluded from physical schema projection, introspection and DDL.
 
 Without `relationMode: 'application'`, a schema requesting physical FKs is
-rejected. Explicit `onDelete` and `onUpdate` actions, including `Cascade`,
-`SetNull`, `Restrict` and `NoAction`, are rejected too. Implement the desired
-policy in application code. If authoring a TypeScript contract directly, use
+rejected. If authoring a TypeScript contract directly, use
 `constraint: false`; that option is not a PSL `@relation` argument in the pinned
 Prisma version.
 
-## Read related rows
+## Client-side referential actions
+
+```prisma
+project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade, index: false)
+```
+
+Declare `@@index([projectId])` to avoid scans during reference lookups. Supported
+`onDelete` actions are Cascade, SetNull and Restrict. SetNull requires nullable
+child columns. NoAction-only declarations are rejected: use Restrict for an
+explicit guard. SetDefault is rejected. `onUpdate` accepts only NoAction/Restrict;
+omitting it means NoAction. Cascade cycles, including self-relations, are rejected
+because recursive deletion cannot be represented by one static YQL program.
+
+A parent delete captures selected keys and applies guards, child deletes or
+SetNull updates in the same YQL program and Serializable transaction. Composite
+references join on all key columns. Restrict/missing-parent failures surface as
+non-retryable `YDB.REFERENTIAL_ACTION`. Child INSERT/UPDATE/UPSERT operations check
+that each non-null parent exists; a concurrent parent delete conflicts with that
+read and one Serializable transaction aborts. Retry the whole transaction.
+UPSERT-skip with implicit FK defaults is rejected.
+
+Raw YQL, other services and relations without actions bypass this protocol.
+Initially inconsistent data needs repair before enabling actions. Large cascades
+still obey transaction/result limits; index the child FK columns. These checks
+are client behavior, not database constraints.
+
+### Read related rows
 
 ```ts
 const projectSummary = db.orm.Project.fragment((projects) =>
@@ -98,6 +123,9 @@ A required relation in TypeScript does not prove that every writer has maintaine
 the invariant. Do not use a required include as an integrity check.
 
 ## Create or change a reference
+
+The manual recipes below apply to relations **without actions**, such as the
+first schema above. Action-bearing relations perform these checks automatically.
 
 Check the parent **inside the same transaction** that writes the child:
 

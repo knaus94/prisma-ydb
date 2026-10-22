@@ -79,17 +79,37 @@ expected before/after table shapes for verification and recovery.
 
 Automatic primary-key/type reconstruction is refused. Unique indexes can be
 created with a new table; adding one to an existing table is rejected for the
-pinned YDB version. TTL/tiering, column tables, covering/asynchronous indexes and
+pinned YDB version. Numeric TTL/tiering, column tables, covering/asynchronous indexes and
 indexes still being built are not silently converted. Partitioning and replica
 settings remain operational configuration outside this schema model.
 
 Use a dedicated database for the managed contract: final verification also
 checks for unrelated tables. Relations keep their ORM metadata while omitting
-physical FKs. Explicit referential actions are rejected. Read
+physical FKs. Action-bearing relations retain client-side behavior with no FK DDL. Read
 [relations and referential integrity](relations.md) before defining deletion
 rules or migrating existing references.
 
 ## Manual and data migrations
+
+### TTL and storage types
+
+```prisma
+@@ttl(field: at, expireAfter: "P30D")
+```
+
+TTL accepts one temporal field per table (`DateTime`, `Date`, `Timestamp`) and a
+nonempty ISO duration made of whole days/hours/minutes/seconds. Fractions,
+months and years are rejected. Creation uses `WITH (TTL = Interval(...) ON ...)`;
+policy changes use `ALTER TABLE ... SET (TTL = ...)`, and removal uses
+`ALTER TABLE ... RESET (TTL)`. Setting/changing a policy is classified destructive
+because background deletion can remove data. Review the generated operation.
+Introspection preserves date-column TTL and rejects numeric TTL and tiering.
+Expiry is asynchronous: queries must still filter out logically expired rows.
+
+Value objects and scalar/enum lists are physical Json columns. Introspection
+cannot recover list identity, object definitions or element codecs from Json;
+native Timestamp is inferred as DateTime. Decimal precision/scale changes require
+a reviewed data migration, since YDB cannot change a row-table column type in place.
 
 `prisma migration new --name change` scaffolds a manual migration. Data-only
 migrations without a schema change also need `--from <current-storage-hash>`.
@@ -145,8 +165,16 @@ journal rows.
 
 ## Introspection and runtime verification
 
+String enums are stored in `Utf8` columns. Adding or removing enum members changes
+contract metadata and its storage hash, even though the physical column is
+unchanged. Generate and apply the usual migration to record the new snapshot and
+marker; a change limited to the member list has no DDL operations. Renaming a
+member with an unchanged explicit stored string needs no data rewrite. Changing
+the stored string requires an explicit data migration for existing rows.
+
 `prisma contract infer --output inferred.prisma` writes a separate schema for
 inspection. It cannot recover unconstrained relations or runtime ID generators.
+It also cannot recover enum definitions: their columns are inferred as `String`.
 Keep the original `.prisma` schema as the source of truth.
 
 The runtime reads the marker on first use, including when the first operation is

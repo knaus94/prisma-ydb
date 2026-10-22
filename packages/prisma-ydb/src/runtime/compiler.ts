@@ -20,6 +20,7 @@ import {
 import type { Value } from '@ydbjs/value';
 import { typeToString } from '@ydbjs/value/print';
 import { yqlTypeForCodec } from './codecs.js';
+import { ReferentialProgram } from './referential.js';
 import {
   lowerRelationIncludes,
   renderYdbExists,
@@ -49,8 +50,13 @@ function literal(value: unknown): string {
     return `Timestamp(${JSON.stringify(value.toISOString())})`;
   return unsupported('inline values of this type; use a typed parameter');
 }
-function literalDefault(value: unknown, codecId: string): string {
-  const type = yqlTypeForCodec(codecId);
+function literalDefault(
+  value: unknown,
+  codecId: string,
+  typeParams?: unknown,
+  many = false,
+): string {
+  const type = many ? 'Json' : yqlTypeForCodec(codecId, typeParams);
   if (type === 'Json' || type === 'JsonDocument') {
     const encoded = JSON.stringify(value);
     if (encoded === undefined)
@@ -68,10 +74,16 @@ function isValue(value: unknown): value is Value {
     'type' in value
   );
 }
-export function inferYqlParameterType(ref: AnyParamRef): string {
+export function inferYqlParameterType(
+  ref: AnyParamRef,
+  listColumn = false,
+): string {
   const codec = ref.codec;
   let type: string;
-  if (codec) type = yqlTypeForCodec(codec.codecId);
+  if (codec)
+    type = listColumn
+      ? 'Json'
+      : yqlTypeForCodec(codec.codecId, codec.typeParams);
   else if (ref.kind === 'prepared-param-ref')
     return unsupported('untyped prepared parameters');
   else if (isValue(ref.value)) return typeToString(ref.value.type);
@@ -95,7 +107,7 @@ export function inferYqlParameterType(ref: AnyParamRef): string {
         );
     }
   }
-  if (codec?.many) type = `List<${type}>`;
+  if (codec?.many && !listColumn) type = `List<${type}>`;
   if (ref.kind === 'prepared-param-ref' ? ref.nullable : ref.value === null)
     type += '?';
   return type;
@@ -274,7 +286,7 @@ class YqlCompiler {
         return `${expr.fn.toUpperCase()}(${expr.expr ? render(expr.expr) : '*'})`;
       case 'cast': {
         if (
-          !/^(?:Bool|Int(?:8|16|32|64)|Uint(?:8|16|32|64)|Float|Double|Utf8|String|Json|JsonDocument|Date|Datetime|Timestamp|Interval)\??$/.test(
+          !/^(?:Bool|Int(?:8|16|32|64)|Uint(?:8|16|32|64)|Float|Double|Utf8|String|Json|JsonDocument|Date|Datetime|Timestamp|Interval|Decimal\((?:[1-9]|[12]\d|3[0-5]),\s*\d{1,2}\))\??$/.test(
             expr.targetType,
           )
         )
@@ -291,8 +303,9 @@ class YqlCompiler {
       }
       case 'operation':
         return expr.lowering.template.replace(
-          /\{\{self\}\}|\{\{arg(\d+)\}\}/g,
+          /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\{\{self\}\}|\{\{arg(\d+)\}\}/g,
           (token, index: string | undefined) => {
+            if (token.startsWith('"') || token.startsWith("'")) return token;
             const value =
               token === '{{self}}' ? expr.self : expr.args[Number(index)];
             if (!value)
@@ -377,9 +390,9 @@ class YqlCompiler {
     this.resultColumns = columns;
     return ` RETURNING ${[...new Set(columns.map(([, column]) => quoteYqlIdentifier(column)))].join(', ')}`;
   }
-  insert(ast: InsertAst): string {
+  insert(ast: InsertAst, program?: ReferentialProgram): string {
     if (!ast.rows.length) return unsupported('an empty INSERT');
-    if (ast.onConflict) return this.upsert(ast);
+    if (ast.onConflict) return this.upsert(ast, program);
     const columns = [...new Set(ast.rows.flatMap((row) => Object.keys(row)))];
     if (!columns.length)
       return unsupported(
@@ -400,9 +413,49 @@ class YqlCompiler {
             .join(', ')})`,
       )
       .join(', ');
+    if (program?.outgoing(ast.table).length) {
+      const table = this.tableDefinition(ast.table);
+      const fields = [
+        ...new Set(
+          program
+            .outgoing(ast.table)
+            .flatMap(({ fk }) => [...fk.source.columns]),
+        ),
+      ];
+      program.checkParents(
+        ast.table,
+        ast.rows
+          .map(
+            (row) =>
+              `SELECT ${fields
+                .map((name) => {
+                  const value = row[name];
+                  const column = table.columns[name]!;
+                  const expression =
+                    value && value.kind !== 'default-value'
+                      ? this.expr(value)
+                      : column.default?.kind === 'literal'
+                        ? literalDefault(
+                            column.default.value,
+                            column.codecId,
+                            column.typeParams,
+                            !!column.many,
+                          )
+                        : column.nullable
+                          ? `CAST(NULL AS ${yqlTypeForCodec(column.codecId, column.typeParams)}?)`
+                          : unsupported(
+                              `INSERT missing foreign key field ${name}`,
+                            );
+                  return `${expression} AS ${quoteYqlIdentifier(name)}`;
+                })
+                .join(', ')}`,
+          )
+          .join(' UNION ALL '),
+      );
+    }
     return `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) VALUES ${rows}${this.returning(ast.returning)}`;
   }
-  upsert(ast: InsertAst): string {
+  upsert(ast: InsertAst, program?: ReferentialProgram): string {
     const conflict = ast.onConflict;
     if (!conflict) throw new TypeError('UPSERT requires a conflict clause');
     if (conflict.action.kind === 'do-nothing' && !conflict.columns.length)
@@ -443,7 +496,18 @@ class YqlCompiler {
           return unsupported('UPSERT with explicit DEFAULT values');
         return `${this.expr(value)} AS ${quoteYqlIdentifier(column)}`;
       });
-      return `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${values.join(', ')} FROM AS_TABLE([<|__prisma_ydb_dummy: 0|>]) WHERE NOT EXISTS(SELECT * FROM ${this.table(ast.table)} WHERE ${where})${this.returning(ast.returning)}`;
+      const candidates = `SELECT ${values.join(', ')} FROM AS_TABLE([<|__prisma_ydb_dummy: 0|>]) WHERE NOT EXISTS(SELECT * FROM ${this.table(ast.table)} WHERE ${where})`;
+      if (
+        program?.outgoing(ast.table).length &&
+        program
+          .outgoing(ast.table)
+          .some(({ fk }) =>
+            fk.source.columns.some((column) => !(column in row)),
+          )
+      )
+        return unsupported('UPSERT SKIP with implicit foreign key defaults');
+      program?.checkParents(ast.table, candidates);
+      return `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) ${candidates}${this.returning(ast.returning)}`;
     }
     const existing = '$__prisma_ydb_existing';
     const columns = Object.keys(table.columns);
@@ -455,9 +519,14 @@ class YqlCompiler {
         supplied && supplied.kind !== 'default-value'
           ? this.expr(supplied)
           : definition.default?.kind === 'literal'
-            ? literalDefault(definition.default.value, definition.codecId)
+            ? literalDefault(
+                definition.default.value,
+                definition.codecId,
+                definition.typeParams,
+                !!definition.many,
+              )
             : definition.nullable
-              ? `CAST(NULL AS ${yqlTypeForCodec(definition.codecId)}?)`
+              ? `CAST(NULL AS ${definition.many ? 'Json' : yqlTypeForCodec(definition.codecId, definition.typeParams)}?)`
               : unsupported(`UPSERT missing required create field ${column}`);
       const updated =
         conflict.action.kind === 'do-update-set'
@@ -469,7 +538,17 @@ class YqlCompiler {
       const expression = `IF(EXISTS(SELECT * FROM ${existing}), ${update}, ${create})`;
       return `${definition.nullable ? expression : `Unwrap(${expression})`} AS ${quoteYqlIdentifier(column)}`;
     });
-    return `${existing} = SELECT * FROM ${this.table(ast.table)} WHERE ${where};\nUPSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${select.join(', ')}${this.returning(ast.returning)}`;
+    const capture = `${existing} = SELECT * FROM ${this.table(ast.table)} WHERE ${where};`;
+    if (!program)
+      return `${capture}\nUPSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${select.join(', ')}${this.returning(ast.returning)}`;
+    program.statements.push(capture);
+    program.update(
+      ast.table,
+      `SELECT * FROM ${existing}`,
+      Object.keys(updateSet ?? {}),
+    );
+    program.checkParents(ast.table, `SELECT ${select.join(', ')}`);
+    return `UPSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${select.join(', ')}${this.returning(ast.returning)}`;
   }
   render(ast: AnyQueryAst): string {
     if (ast.kind === 'select') return this.select(ast);
@@ -478,19 +557,56 @@ class YqlCompiler {
         .map((part) => (typeof part === 'string' ? part : this.expr(part)))
         .join('');
     this.mutationTable = ast.table.alias ?? ast.table.name;
-    if (ast.kind === 'insert') return this.insert(ast);
+    const program = ReferentialProgram.applies(this.contract, ast.table)
+      ? new ReferentialProgram(
+          this.contract,
+          (source) => this.table(source),
+          quoteYqlIdentifier,
+        )
+      : undefined;
+    if (ast.kind === 'insert') {
+      const statement = this.insert(ast, program);
+      return program?.render(statement) ?? statement;
+    }
+    const where = ast.where ? ` WHERE ${this.expr(ast.where)}` : '';
+    const original = program
+      ? `SELECT * FROM ${this.table(ast.table)}${where}`
+      : '';
     if (ast.kind === 'update') {
       if (!Object.keys(ast.set).length) return unsupported('an empty UPDATE');
-      return `UPDATE ${this.table(ast.table)} SET ${Object.entries(ast.set)
+      program?.update(ast.table, original, Object.keys(ast.set));
+      if (
+        program
+          ?.outgoing(ast.table)
+          .some(({ fk }) =>
+            fk.source.columns.some((column) => column in ast.set),
+          )
+      ) {
+        const fields = [
+          ...new Set(
+            program
+              .outgoing(ast.table)
+              .flatMap(({ fk }) => [...fk.source.columns]),
+          ),
+        ];
+        program.checkParents(
+          ast.table,
+          `SELECT ${fields.map((column) => `${ast.set[column] ? this.expr(ast.set[column]) : quoteYqlIdentifier(column)} AS ${quoteYqlIdentifier(column)}`).join(', ')} FROM ${this.table(ast.table)}${where}`,
+        );
+      }
+      const statement = `UPDATE ${this.table(ast.table)} SET ${Object.entries(
+        ast.set,
+      )
         .map(
           ([column, value]) =>
             `${quoteYqlIdentifier(column)} = ${this.expr(value)}`,
         )
-        .join(
-          ', ',
-        )}${ast.where ? ` WHERE ${this.expr(ast.where)}` : ''}${this.returning(ast.returning)}`;
+        .join(', ')}${where}${this.returning(ast.returning)}`;
+      return program?.render(statement) ?? statement;
     }
-    return `DELETE FROM ${this.table(ast.table)}${ast.where ? ` WHERE ${this.expr(ast.where)}` : ''}${this.returning(ast.returning)}`;
+    program?.delete(ast.table, original);
+    const statement = `DELETE FROM ${this.table(ast.table)}${where}${this.returning(ast.returning)}`;
+    return program?.render(statement) ?? statement;
   }
 }
 
@@ -500,7 +616,30 @@ export function compileYql(
 ): LoweredStatement {
   const compiler = new YqlCompiler(contract, ast);
   const body = compiler.render(ast);
-  const types = compiler.refs.map(inferYqlParameterType);
+  const listParams = new Set<AnyParamRef>();
+  if (ast.kind === 'insert' || ast.kind === 'update') {
+    const table = compiler.tableDefinition(ast.table);
+    const collect = (values: Readonly<Record<string, unknown>>) => {
+      for (const [name, value] of Object.entries(values)) {
+        if (
+          table?.columns[name]?.many &&
+          value &&
+          typeof value === 'object' &&
+          'kind' in value &&
+          (value.kind === 'param-ref' || value.kind === 'prepared-param-ref')
+        )
+          listParams.add(value as AnyParamRef);
+      }
+    };
+    if (ast.kind === 'insert') {
+      ast.rows.forEach(collect);
+      if (ast.onConflict?.action.kind === 'do-update-set')
+        collect(ast.onConflict.action.set);
+    } else collect(ast.set);
+  }
+  const types = compiler.refs.map((ref) =>
+    inferYqlParameterType(ref, listParams.has(ref)),
+  );
   const headers = [
     `-- prisma-ydb-param-types: ${JSON.stringify(types)}`,
     ...(ast.kind === 'insert' || ast.kind === 'update' || ast.kind === 'delete'

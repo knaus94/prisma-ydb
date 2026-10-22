@@ -1,18 +1,48 @@
 // use prisma-8
 
+enum TaskStatus {
+  TODO
+  DOING
+  DONE
+}
+
+type NotificationSettings {
+  email  Boolean
+  digest String?
+}
+
+type ProjectSettings {
+  notifications NotificationSettings
+  theme         String?
+}
+
 model Project {
-  id    String @id @default(uuid())
-  name  String
-  tasks Task[]
+  id       String           @id @default(uuid())
+  name     String
+  budget   Decimal(12, 2)?
+  tags     String[]         @default([])
+  settings ProjectSettings?
+  tasks    Task[]
 }
 
 model Task {
-  id        String   @id @default(uuid())
+  id        String               @id @default(uuid())
   title     String
-  done      Boolean  @default(false)
-  createdAt DateTime
+  done      Boolean              @default(false)
+  status    TaskStatus           @default(TODO)
+  dueOn     Date?
+  createdAt temporal.createdAt()
+  updatedAt temporal.updatedAt()
   projectId String?
-  project   Project? @relation(fields: [projectId], references: [id], index: false)
+  project   Project?             @relation(fields: [projectId], references: [id], onDelete: Cascade, index: false)
 
   @@index([projectId])
+}
+
+model AuditEvent {
+  id     String @id @default(uuid())
+  action String
+  at     temporal.Timestamp(onCreate: now)
+
+  @@ttl(field: at, expireAfter: "P30D")
 }
