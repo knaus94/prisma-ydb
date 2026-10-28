@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.7
 
 - Fix `whereKeys` typing: it returns Prisma's `fns` condition type, so `where((m) => whereKeys(m, keys))` and `and(m.flag.eq(true), whereKeys(m, keys))` compile, and it accepts model accessors with relations. Key objects are typed by the model's scalar field inputs. The generated YQL is unchanged.
 - Add `range: { field, gt | gte, lt | lte }` to `db.scanIndex`: server-side bounds on the first index field after `equal`, so out-of-range rows no longer consume the budget or affect `inspected`, `lastKey` and `exhausted`.
