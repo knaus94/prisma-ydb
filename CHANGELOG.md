@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Accept exact `bigint` microseconds and `TimestampMicrosValue` in `DateTime` writes (ORM, `yqlModel`, `bulkUpsert`); add opt-in `bigint` microsecond results through `yqlModel(name, { micros })`. ORM `DateTime` reads remain `Date`, and the stored JSON form of millisecond instants is unchanged.
+- Add per-partition changefeed `stop(reason)`, `pause()` and `resume()` in `onPartitionStart` and on batch partitions, so one refused partition no longer ends the iterator. Add `commitThrough(event)` and its alias `skip(event)` to acknowledge a decoded poison event. Commits on a stopped partition reject; `batch.commit()` skips stopped partitions.
+- Add changefeed `fields` projection, decoding only the selected fields plus the primary key.
+- Add Typed YQL files: `prisma-ydb yql generate` / `--check` infer parameter and result types through YDB EXPLAIN and generate reusable `defineYql` functions for clients and transactions, with exact bigint Timestamp microseconds.
+- Add `yqlStatement({ params, results, text })` for statements built at runtime: a reusable callable `(db | tx, values, options)` with generated `DECLARE`s, typed parameters and decoded result sets. Unused parameter declarations are rejected when the statement is defined.
+- Add `wireType()` on every descriptor and the `optional`, `list` and `struct` descriptor helpers for typed NULLs and empty lists; add `ydbDecimal.with(precision, scale)` as a regular descriptor.
+- Add `yqlModel(name, { extra })` for synthetic typed members in parameters and results.
+- Add `ydbContract(json)` to hydrate a generated contract without constructing a client or loading migration code.
+- Add the `ydbView(index)` read annotation for ORM queries and `db.scanIndex(model, { index, equal, after, budget, direction, select, accept })` for budgeted index keyset pages with a residual filter.
+- Add `whereKeys(scope, keys)` for composite-key lists, compiled to one typed `List<Tuple<...>>` parameter; reads pick a matching secondary index automatically, and updates/deletes accept primary-key prefixes.
+- Accept safe integer `number` inputs for `Int64`/`Uint64`; unsafe numbers are still rejected.
+- Export `nativeCodecConversions`, `timestampFromMicros`, `timestampMicros` and `timestampText` from the runtime entry point.
+
 ## 0.1.0-rc.5
 
 - Add `tx.commitWith(() => ...)` to commit with a single final direct statement, saving the separate commit RPC; ORM mutation scopes retain a normal atomic commit. Reject empty thunks and multiple direct statements.

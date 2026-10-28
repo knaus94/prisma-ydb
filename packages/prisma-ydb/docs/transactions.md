@@ -240,3 +240,10 @@ rules still belong to the application; see [relations](relations.md).
 
 Official references: [YDB transactions](https://ydb.tech/docs/en/concepts/transactions),
 [YDB status codes](https://ydb.tech/docs/en/reference/ydb-sdk/ydb-status-codes).
+
+Generated YQL functions and standalone dynamic statements share the current
+transaction: `taskHistory(tx, params, options)` or
+`yqlStatement(definition)(tx, values, options)`. Define reusable dynamic
+statements outside the callback to compile parameter codecs and result decoders
+once. Run transaction-targeted calls inside the callback lifetime. See
+[Typed YQL files](yql.md#typed-yql-files).

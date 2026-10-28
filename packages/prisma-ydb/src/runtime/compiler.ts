@@ -23,6 +23,7 @@ import { typeToString } from '@ydbjs/value/print';
 import { optionsForTable } from '../control/options.js';
 import { yqlTypeForCodec } from './codecs.js';
 import { keyPathFor } from './keys.js';
+import { viewForAst } from './operations.js';
 import { ReferentialProgram } from './referential.js';
 import {
   lowerRelationIncludes,
@@ -163,6 +164,23 @@ class YqlCompiler {
     this.indices = new Map(this.refs.map((ref, index) => [ref, index + 1]));
     const namespaces = Object.keys(contract.storage.namespaces);
     this.defaultNamespace = namespaces.length === 1 ? namespaces[0] : undefined;
+    const view = viewForAst(ast);
+    if (view !== undefined) {
+      if (ast.kind !== 'select' || ast.from?.kind !== 'table-source')
+        throw new TypeError('ydbView requires a root table SELECT');
+      const table = this.tableDefinition(ast.from);
+      const index = table.indexes.find((index) => index.name === view);
+      if (
+        !index ||
+        index.where ||
+        !index.columns?.length ||
+        index.columns.some((column) => !table.columns[column])
+      )
+        throw new TypeError(
+          `Unknown or unsupported YDB index ${view} on ${ast.from.name}`,
+        );
+      this.views.set(ast.from, view);
+    }
   }
   private reserveIdentifiers(): Set<string> {
     if (this.reservedIdentifiers) return this.reservedIdentifiers;
@@ -372,6 +390,54 @@ class YqlCompiler {
         return `${fn}(${expr.args.map(render).join(', ')})`;
       }
       case 'operation':
+        if (expr.method === 'whereKeys' && expr.lowering.template !== 'FALSE') {
+          const columns = [expr.self, ...expr.args.slice(0, -1)];
+          const source =
+            this.ast.kind === 'select'
+              ? this.ast.from
+              : this.ast.kind === 'update' || this.ast.kind === 'delete'
+                ? this.ast.table
+                : undefined;
+          if (
+            source?.kind !== 'table-source' ||
+            columns.some(
+              (column) =>
+                column.kind !== 'column-ref' ||
+                column.table !== (source.alias ?? source.name),
+            )
+          )
+            throw new TypeError(
+              'whereKeys requires columns from the root model',
+            );
+          const table = this.tableDefinition(source);
+          const names = columns.map((column) => (column as ColumnRef).column);
+          const path = keyPathFor(table, names);
+          if (!path || (this.ast.kind !== 'select' && path !== 'primary'))
+            throw new TypeError(
+              'whereKeys fields must follow a primary key or index prefix',
+            );
+          if (
+            path !== 'primary' &&
+            this.ast.kind === 'select' &&
+            !this.views.has(source) &&
+            !this.columnStore(source)
+          ) {
+            const candidates = table.indexes.filter(
+              (index) =>
+                !index.where &&
+                names.every(
+                  (name, position) => index.columns?.[position] === name,
+                ),
+            );
+            const shortest = candidates.reduce((chosen, index) =>
+              (index.columns?.length ?? Infinity) <
+              (chosen.columns?.length ?? Infinity)
+                ? index
+                : chosen,
+            );
+            this.views.set(source, shortest.name);
+          }
+        }
         return expr.lowering.template.replace(
           /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\{\{self\}\}|\{\{arg(\d+)\}\}/g,
           (token, index: string | undefined) => {
@@ -423,6 +489,7 @@ class YqlCompiler {
       );
     if (ast.distinctOn?.length)
       return unsupported('DISTINCT ON; use distinct()/window functions');
+    const where = ast.where ? this.expr(ast.where) : undefined;
     const relations = lowerRelationIncludes(ast, this.relationContext());
     const projection = ast.projection
       .map(
@@ -438,7 +505,7 @@ class YqlCompiler {
       sql += ` ${join.joinType.toUpperCase()} JOIN ${this.source(join.source)} ON ${join.on.kind === 'eq-col-join-on' ? `${this.expr(join.on.left)} = ${this.expr(join.on.right)}` : this.expr(join.on)}`;
     }
     sql += relations.joins.join('');
-    if (ast.where) sql += ` WHERE ${this.expr(ast.where)}`;
+    if (where) sql += ` WHERE ${where}`;
     if (ast.groupBy?.length)
       sql += ` GROUP BY ${ast.groupBy.map((expr) => this.expr(expr)).join(', ')}`;
     if (ast.having) sql += ` HAVING ${this.expr(ast.having)}`;

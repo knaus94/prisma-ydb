@@ -6,8 +6,19 @@ import {
   type Expression,
   type ScopeField,
 } from '@prisma/orm-family-sql/relational-core/expression';
-import type { AnyExpression } from '@prisma/orm-family-sql/relational-core/ast';
-import { encodeYdbJson } from './codecs.js';
+import type {
+  AnyExpression,
+  AnyQueryAst,
+} from '@prisma/orm-family-sql/relational-core/ast';
+import { encodeYdbJson, encodeYdbValue } from './codecs.js';
+import { defineAnnotation } from '@prisma/orm-framework/components/runtime';
+import type { SqlMiddleware } from '@prisma/orm-family-sql/runtime';
+import {
+  ParamRef,
+  LiteralExpr,
+} from '@prisma/orm-family-sql/relational-core/ast';
+import { List } from '@ydbjs/value/list';
+import { Tuple } from '@ydbjs/value/tuple';
 
 export type YdbJsonPath = string | readonly (string | number)[];
 
@@ -191,3 +202,97 @@ export const ydbQueryOperations = {
     },
   },
 } as const satisfies SqlOperationDescriptors;
+
+/** Explicit index selection through Prisma's native read annotation surface. */
+export const ydbView = defineAnnotation<string>()({
+  namespace: 'prisma-ydb/view',
+  applicableTo: ['read'],
+});
+
+// Weak keys retain no query/contract once the corresponding AST is released.
+const readViews = new WeakMap<AnyQueryAst, string>();
+export function viewForAst(ast: AnyQueryAst): string | undefined {
+  return readViews.get(ast);
+}
+
+/** Shared by client runtimes and offline compiler harnesses. */
+export const ydbReadMiddleware: SqlMiddleware = {
+  name: 'prisma-ydb/read-annotations',
+  familyId: 'sql',
+  targetId: 'ydb',
+  async beforeCompile(draft) {
+    if (draft.meta.annotations?.['prisma-ydb/view'] === undefined) return;
+    const view = ydbView.read(draft);
+    if (typeof view !== 'string' || !view)
+      throw new TypeError('ydbView requires an index name');
+    if (draft.ast.kind !== 'select' || draft.ast.from?.kind !== 'table-source')
+      throw new TypeError('ydbView requires a root table SELECT');
+    const ast = Object.assign(
+      Object.create(Object.getPrototypeOf(draft.ast)),
+      draft.ast,
+    ) as AnyQueryAst;
+    readViews.set(ast, view);
+    return { ...draft, ast };
+  },
+};
+
+/** A typed tuple-list predicate for a primary key or secondary-index prefix. */
+export function whereKeys<Scope extends Record<string, Expression<ScopeField>>>(
+  scope: Scope,
+  keys: readonly { readonly [Field in keyof Scope]?: unknown }[],
+): Expression<{ codecId: 'ydb/bool@1'; nullable: false }> {
+  if (!Array.isArray(keys)) throw new TypeError('whereKeys requires an array');
+  if (!keys.length)
+    return buildOperation({
+      method: 'whereKeys',
+      args: [LiteralExpr.of(false)],
+      returns: { codecId: 'ydb/bool@1', nullable: false },
+      lowering: { targetFamily: 'sql', template: 'FALSE' },
+    });
+  const names = Object.keys(keys[0] ?? {});
+  if (!names.length) throw new TypeError('whereKeys requires nonempty keys');
+  const expressions = names.map((name) => {
+    const field = scope[name];
+    if (!field) throw new TypeError(`Unknown whereKeys field ${name}`);
+    const ast = field.buildAst();
+    const codec = codecOf(field);
+    if (
+      ast.kind !== 'column-ref' ||
+      !codec ||
+      codec.many ||
+      field.returnType.nullable
+    )
+      throw new TypeError(
+        `whereKeys requires nonnullable scalar columns: ${name}`,
+      );
+    return { ast, codec };
+  });
+  const rows = keys.map((key) => {
+    if (
+      Object.keys(key).length !== names.length ||
+      names.some((name) => !Object.hasOwn(key, name))
+    )
+      throw new TypeError('whereKeys rows must have the same fields');
+    return new Tuple(
+      ...expressions.map(({ codec }, index) => {
+        const value = key[names[index]!];
+        if (value === null || value === undefined)
+          throw new TypeError('whereKeys values cannot be null');
+        return encodeYdbValue(codec.codecId, value, codec.typeParams);
+      }),
+    );
+  });
+  return buildOperation({
+    method: 'whereKeys',
+    args: [
+      expressions[0]!.ast,
+      ...expressions.slice(1).map(({ ast }) => ast),
+      ParamRef.of(new List(...rows)),
+    ],
+    returns: { codecId: 'ydb/bool@1', nullable: false },
+    lowering: {
+      targetFamily: 'sql',
+      template: `AsTuple(${expressions.map((_field, index) => (index ? `{{arg${index - 1}}}` : '{{self}}')).join(', ')}) IN {{arg${expressions.length - 1}}}`,
+    },
+  });
+}

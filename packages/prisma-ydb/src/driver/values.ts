@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 import { uuidFromBigInts } from '@ydbjs/value/uuid';
 import { UuidValue } from './uuid.js';
+import { splitYqlType } from './yql-syntax.js';
 import { ydbJsonForm } from './json-form.js';
 
 const primitiveTypes: Record<string, PrimitiveId> = {
@@ -55,7 +56,8 @@ const jsonParameterType = /^Json\??$/;
 
 /** Parses only the compiler's small parameter-type grammar, never SQL text. */
 export function parameterType(name: string, depth = 0): Type {
-  if (depth > 8 || name.length > 256)
+  name = name.trim();
+  if (depth > 32 || name.length > 16384)
     throw new SqlQueryError('YDB parameter type metadata is too deeply nested');
   if (name.endsWith('?'))
     return create(TypeSchema, {
@@ -64,16 +66,56 @@ export function parameterType(name: string, depth = 0): Type {
         value: { item: parameterType(name.slice(0, -1), depth + 1) },
       },
     });
-  if (name.startsWith('List<') && name.endsWith('>'))
+  for (const [prefix, kind] of [
+    ['Optional', 'optionalType'],
+    ['List', 'listType'],
+  ] as const) {
+    const match = new RegExp(`^${prefix}\\s*<([\\s\\S]*)>$`).exec(name);
+    if (match)
+      return create(TypeSchema, {
+        type: {
+          case: kind,
+          value: { item: parameterType(match[1], depth + 1) },
+        },
+      });
+  }
+  const tuple = /^Tuple\s*<([\s\S]*)>$/.exec(name);
+  if (tuple)
     return create(TypeSchema, {
       type: {
-        case: 'listType',
-        value: { item: parameterType(name.slice(5, -1), depth + 1) },
+        case: 'tupleType',
+        value: {
+          elements: splitYqlType(tuple[1]).map((part) =>
+            parameterType(part, depth + 1),
+          ),
+        },
       },
     });
+  const struct = /^Struct\s*<([\s\S]*)>$/.exec(name);
+  if (struct) {
+    const members = splitYqlType(struct[1]).map((part) => {
+      const pair = splitYqlType(part, ':');
+      if (
+        pair.length !== 2 ||
+        !/^(?:[A-Za-z_][A-Za-z0-9_]*|`(?:``|[^`])+`)$/.test(pair[0])
+      )
+        throw new SqlQueryError('Invalid YDB struct parameter type');
+      return {
+        name: pair[0].startsWith('`')
+          ? pair[0].slice(1, -1).replaceAll('``', '`')
+          : pair[0],
+        type: parameterType(pair[1], depth + 1),
+      };
+    });
+    if (new Set(members.map((m) => m.name)).size !== members.length)
+      throw new SqlQueryError('Duplicate YDB struct member');
+    return create(TypeSchema, {
+      type: { case: 'structType', value: { members } },
+    });
+  }
   if (Object.hasOwn(primitiveTypes, name))
     return new PrimitiveType(primitiveTypes[name]).encode();
-  const decimal = /^Decimal\(([1-9]\d?),\s*(\d{1,2})\)$/.exec(name);
+  const decimal = /^Decimal\s*\(\s*([1-9]\d?)\s*,\s*(\d{1,2})\s*\)$/.exec(name);
   if (decimal) {
     const precision = Number(decimal[1]);
     const scale = Number(decimal[2]);
@@ -83,7 +125,7 @@ export function parameterType(name: string, depth = 0): Type {
       });
   }
   throw new SqlQueryError(
-    'YDB parameter type metadata is unsupported or invalid',
+    `YDB parameter type metadata is unsupported or invalid: ${name}`,
   );
 }
 
@@ -541,6 +583,11 @@ export function columnDecoder(type: Type): Decoder {
       if (!item) invalid('YDB returned a list without an item type');
       const inner = columnDecoder(item);
       return (value) => value.items.map(inner);
+    }
+    case 'tupleType': {
+      const decoders = shape.value.elements.map(columnDecoder);
+      return (value) =>
+        decoders.map((decode, index) => decode(value.items[index]));
     }
     case 'structType': {
       const members = shape.value.members.map((member) => {

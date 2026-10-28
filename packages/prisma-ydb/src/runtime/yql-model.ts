@@ -1,3 +1,5 @@
+import { create } from '@bufbuild/protobuf';
+import { TypeSchema, ValueSchema } from '@ydbjs/api/value';
 import type { Contract } from '@prisma/orm-framework/contract/types';
 import type {
   ExtractFieldInputTypes,
@@ -5,7 +7,13 @@ import type {
   SqlStorage,
 } from '@prisma/orm-family-sql/contract/types';
 import type { YdbParameter, YdbQueryResult } from '../driver/types.js';
-import { nativeCodecConversions } from './codecs.js';
+import {
+  nativeCodecConversions,
+  type YdbTypeDescriptor,
+  type YdbTypeInput,
+  type YdbTypeOutput,
+} from './codecs.js';
+import { timestampMicros } from './temporal.js';
 import { quoteYqlIdentifier } from './compiler.js';
 import {
   compileModelRowEncoder,
@@ -49,7 +57,10 @@ export interface YdbYqlColumn {
   readonly many: boolean;
 }
 
-export interface YdbYqlModel<Input, Output = Input> {
+export interface YdbYqlModel<Input, Output = Input> extends YdbTypeDescriptor<
+  RowInput<Input>,
+  Output
+> {
   /** Quoted physical table path, ready to interpolate into YQL. */
   readonly table: string;
   readonly columns: readonly YdbYqlColumn[];
@@ -100,13 +111,30 @@ export function yqlModel<
   const Field extends keyof YdbYqlInput<C, Name> &
     keyof YdbYqlOutput<C, Name> &
     string = keyof YdbYqlInput<C, Name> & keyof YdbYqlOutput<C, Name> & string,
+  const Micros extends Field = never,
+  const Extra extends Readonly<Record<string, YdbTypeDescriptor>> = Record<
+    never,
+    never
+  >,
 >(
   contract: C,
   name: Name,
-  options: { readonly fields?: readonly Field[] } = {},
+  options: {
+    readonly fields?: readonly Field[];
+    readonly micros?: readonly Micros[];
+    readonly extra?: Extra;
+  } = {},
 ): YdbYqlModel<
-  Pick<YdbYqlInput<C, Name>, Field>,
-  Pick<YdbYqlOutput<C, Name>, Field>
+  Pick<YdbYqlInput<C, Name>, Field> & {
+    [Key in keyof Extra]: YdbTypeInput<Extra[Key]>;
+  },
+  {
+    [Key in Field]: Key extends Micros
+      ? null extends YdbYqlOutput<C, Name>[Key]
+        ? bigint | null
+        : bigint
+      : YdbYqlOutput<C, Name>[Key];
+  } & { [Key in keyof Extra]: YdbTypeOutput<Extra[Key]> }
 > {
   const model = resolveModel(contract, name);
   const selected = options.fields
@@ -129,6 +157,31 @@ export function yqlModel<
   const fields = new Set(selected.map((column) => column.field));
   if (fields.size !== selected.length)
     throw new TypeError('YQL model fields must be unique');
+  const micros = new Set<string>(options.micros);
+  for (const field of micros) {
+    const column = selected.find((column) => column.field === field);
+    if (
+      !column ||
+      column.many ||
+      !['ydb/timestamp@1', 'ydb/timestamp-us@1'].includes(column.codecId)
+    )
+      throw new TypeError(
+        `Micros projection requires a selected Timestamp field: ${field}`,
+      );
+  }
+  const extra = Object.entries(options.extra ?? {}).map(
+    ([field, descriptor]) => {
+      if (
+        !/^[A-Za-z_][A-Za-z0-9_]*$/.test(field) ||
+        ['__proto__', 'constructor', 'prototype'].includes(field)
+      )
+        throw new TypeError(`Invalid extra YQL field ${field}`);
+      if (model.byField.has(field) || model.byColumn.has(field))
+        throw new TypeError(`Extra YQL field collides with model: ${field}`);
+      fields.add(field);
+      return { field, descriptor, codec: descriptor.nativeConversions() };
+    },
+  );
   const columns = selected.map((column) => ({
     field: column.field,
     column: column.column,
@@ -137,7 +190,49 @@ export function yqlModel<
     many: column.many,
   }));
   const encoder = compileModelRowEncoder(selected);
-  const decoders = selected.map(columnDecoder);
+  const decoders = selected.map((column) => {
+    if (!micros.has(column.field)) return columnDecoder(column);
+    return (value: unknown) => {
+      if (value === null) {
+        if (!column.nullable)
+          throw new TypeError(`${column.field} is required and cannot be null`);
+        return null;
+      }
+      if (typeof value === 'bigint') {
+        if (value < 0n || value >= 4291747200000000n)
+          throw new RangeError('Timestamp outside YDB range');
+        return value;
+      }
+      return timestampMicros(value);
+    };
+  });
+  for (const { field, descriptor } of extra)
+    columns.push({
+      field,
+      column: field,
+      yqlType: descriptor.yqlType,
+      nullable: descriptor.wireType().type.case === 'optionalType',
+      many: false,
+    });
+  const type = create(TypeSchema, {
+    type: {
+      case: 'structType',
+      value: {
+        members: [
+          ...(encoder.type.type.case === 'structType'
+            ? encoder.type.type.value.members
+            : []),
+          ...extra.map(({ field, descriptor }) => ({
+            name: field,
+            type: descriptor.wireType(),
+          })),
+        ],
+      },
+    },
+  });
+  const listWireType = create(TypeSchema, {
+    type: { case: 'listType', value: { item: type } },
+  });
   const structType = `Struct<${columns.map((column) => `${quoteYqlIdentifier(column.column)}:${column.yqlType}`).join(',')}>`;
   const listType = `List<${structType}>`;
   const encode = (row: unknown, index: number) => {
@@ -146,9 +241,22 @@ export function yqlModel<
     for (const field in row)
       if (Object.hasOwn(row, field) && !fields.has(field))
         throw new TypeError(`Unknown field ${field} on YQL model ${name}`);
-    return encoder.row(row as Readonly<Record<string, unknown>>, index);
+    const record = row as Readonly<Record<string, unknown>>;
+    const value = encoder.row(record, index);
+    for (const { field, codec } of extra) {
+      if (!Object.hasOwn(record, field))
+        throw new TypeError(`Missing extra YQL field ${field}`);
+      value.items.push(codec.encode(record[field]));
+    }
+    return value;
   };
-  type Output = Pick<YdbYqlOutput<C, Name>, Field>;
+  type Output = {
+    [Key in Field]: Key extends Micros
+      ? null extends YdbYqlOutput<C, Name>[Key]
+        ? bigint | null
+        : bigint
+      : YdbYqlOutput<C, Name>[Key];
+  } & { [Key in keyof Extra]: YdbTypeOutput<Extra[Key]> };
   const decode = (row: Readonly<Record<string, unknown>>): Output => {
     const result: Record<string, unknown> = {};
     for (let index = 0; index < selected.length; index++) {
@@ -157,6 +265,11 @@ export function yqlModel<
         throw new TypeError(`Missing YDB column ${column.column}`);
       result[column.field] = decoders[index](row[column.column]);
     }
+    for (const { field, codec } of extra) {
+      if (!Object.hasOwn(row, field))
+        throw new TypeError(`Missing YDB column ${field}`);
+      result[field] = codec.decode(row[field]);
+    }
     return result as Output;
   };
   return {
@@ -164,6 +277,17 @@ export function yqlModel<
     columns,
     structType,
     listType,
+    yqlType: structType,
+    wireType: () => type,
+    wire: (row) => ({ type, value: encode(row, 0) }),
+    nativeConversions: () => ({
+      encode: (row) => encode(row, 0),
+      decode: (row) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row))
+          throw new TypeError('YQL model result requires an object');
+        return decode(row as Readonly<Record<string, unknown>>);
+      },
+    }),
     declare(paramName, kind) {
       const parameter = paramName.startsWith('$') ? paramName : `$${paramName}`;
       if (!/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(parameter))
@@ -172,8 +296,11 @@ export function yqlModel<
         throw new TypeError('YQL model declaration requires list or struct');
       return `DECLARE ${parameter} AS ${kind === 'list' ? listType : structType};`;
     },
-    rows: (rows) => encoder.list(rows.map(encode)),
-    row: (row) => ({ type: encoder.type, value: encode(row, 0) }),
+    rows: (rows) => ({
+      type: listWireType,
+      value: create(ValueSchema, { items: rows.map(encode) }),
+    }),
+    row: (row) => ({ type, value: encode(row, 0) }),
     decode,
     decodeAll(result) {
       const rows =

@@ -1,0 +1,5 @@
+{
+  "text": "$x = 1;",
+  "ast": "(\n(return (KqpPhysicalQuery '() '() '('('\"type\" '\"query\"))))\n)\n",
+  "plan": "{\"Plan\":{\"Plans\":[],\"Node Type\":\"Query\",\"PlanNodeType\":\"Query\"},\"meta\":{\"version\":\"0.2\",\"type\":\"query\"},\"tables\":[],\"SimplifiedPlan\":{\"PlanNodeId\":0,\"Node Type\":\"Query\",\"OptimizerStats\":{\"EquiJoinsCount\":0,\"JoinsCount\":0},\"PlanNodeType\":\"Query\"}}"
+}

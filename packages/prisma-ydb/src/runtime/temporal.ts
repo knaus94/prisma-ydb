@@ -111,8 +111,10 @@ export function timestampFromMicros(value: bigint): string {
 export class TimestampMicrosValue implements Value<PrimitiveType> {
   readonly type = timestampType;
   readonly value: bigint;
-  constructor(value: string | Date) {
-    this.value = timestampMicros(value);
+  constructor(value: string | Date | bigint) {
+    if (typeof value === 'bigint' && (value < 0n || value >= microsLimit))
+      throw new RangeError('Timestamp outside YDB range');
+    this.value = typeof value === 'bigint' ? value : timestampMicros(value);
   }
   encode(): WireValue {
     return create(ValueSchema, {

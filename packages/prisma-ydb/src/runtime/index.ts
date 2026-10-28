@@ -16,6 +16,7 @@ export type {
   YdbChangeEvent,
   YdbChangefeedOptions,
   YdbChangefeedPartition,
+  YdbChangefeedPartitionControl,
   YdbChangefeedStartPosition,
 } from './changefeed.js';
 export type { YdbTransactionMode } from '../driver/index.js';
@@ -39,12 +40,31 @@ export {
   ydbDataTypes,
   ydbScalarDescriptors,
   yqlTypeForCodec,
+  nativeCodecConversions,
+  optional,
+  list,
+  struct,
+  type YdbTypeDescriptor,
+  type YdbTypeInput,
+  type YdbTypeOutput,
+  type NativeCodecConversions,
   type CodecTypes,
 } from './codecs.js';
 export { DecimalValue, DecimalType } from './decimal.js';
 export { UuidValue } from '../driver/uuid.js';
-export { TimestampMicrosValue } from './temporal.js';
-export { ydbQueryOperations, type YdbJsonPath } from './operations.js';
+export {
+  TimestampMicrosValue,
+  timestampFromMicros,
+  timestampMicros,
+  timestampText,
+} from './temporal.js';
+export {
+  ydbQueryOperations,
+  ydbView,
+  whereKeys,
+  ydbReadMiddleware,
+  type YdbJsonPath,
+} from './operations.js';
 export type QueryOperationTypes<
   CT extends Record<
     string,
@@ -103,3 +123,27 @@ export {
   withRetry,
   type WithRetryOptions,
 } from '../driver/index.js';
+
+export { ydbContract } from './contract.js';
+export {
+  yqlStatement,
+  columns,
+  type YdbYqlParams,
+  type YdbYqlValues,
+  type YdbYqlResults,
+  type YdbYqlResultSpec,
+  type YdbYqlResultRows,
+  type YdbYqlStatementOptions,
+  type YdbYqlQueryable,
+  type YdbYqlStatementResult,
+  type YdbYqlStatement,
+} from './yql-statement.js';
+
+export type { YdbIndexScanOptions, YdbIndexScanResult } from './keys.js';
+
+export {
+  defineYql,
+  type YqlFunction,
+  type YqlTypedMember,
+} from './define-yql.js';
+export type { JsonValue } from '@prisma/orm-framework/contract/types';

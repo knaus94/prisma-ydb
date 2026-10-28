@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { yqlModel, TimestampMicrosValue } from 'prisma-ydb/runtime';
 import { createFixture, quote } from './helpers.ts';
 
 test('bulkUpsert encodes model rows through the contract codecs', async (context) => {
@@ -94,4 +95,29 @@ test('bulkUpsert encodes model rows through the contract codecs', async (context
     /Row 0: Expected a finite number/,
   );
   assert.deepEqual(await db.bulkUpsert('Item', []), { rows: 0, chunks: 0 });
+  const micros = 1_767_323_045_123_456n;
+  await db.bulkUpsert('Item', [
+    { id: 'exact-a', n: 1, tags: [], at: micros },
+    {
+      id: 'exact-b',
+      n: 2,
+      tags: [],
+      at: new TimestampMicrosValue(micros + 1n),
+    },
+  ]);
+  const clock = yqlModel(db.contract, 'Item', {
+    fields: ['id', 'at'],
+    micros: ['at'],
+  });
+  assert.deepEqual(
+    clock.decodeAll(
+      await db.yql(
+        `SELECT id, at FROM ${clock.table} WHERE id IN ('exact-a', 'exact-b') ORDER BY id;`,
+      ),
+    ),
+    [
+      { id: 'exact-a', at: micros },
+      { id: 'exact-b', at: micros + 1n },
+    ],
+  );
 });

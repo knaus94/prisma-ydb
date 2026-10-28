@@ -1,0 +1,3 @@
+DECLARE $id AS Utf8;
+DECLARE $at AS Timestamp;
+UPDATE `Task` SET done = TRUE, updatedAt = $at WHERE id = $id;

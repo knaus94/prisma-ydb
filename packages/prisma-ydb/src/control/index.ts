@@ -35,3 +35,4 @@ export type {
   YdbChangefeed,
   YdbTableOptions,
 } from './options.js';
+export { generateYql, type GenerateYqlOptions } from './yql-generate.js';

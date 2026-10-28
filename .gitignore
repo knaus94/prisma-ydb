@@ -14,3 +14,8 @@ tmp/
 *.log
 *.tgz
 .omc
+
+# Keep the Typed YQL example reproducible in source control.
+!examples/basic/src/generated/
+examples/basic/src/generated/*
+!examples/basic/src/generated/yql.ts

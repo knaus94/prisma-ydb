@@ -17,12 +17,30 @@ production clusters or certified by Prisma/YDB.
 | `prisma-ydb/runtime`     | `ydb`, `YdbClient`, codecs, native typed values           |
 | `prisma-ydb/driver`      | Low-level driver, native streaming API, structured errors |
 | `prisma-ydb/config`      | `defineYdbConfig` for the official Prisma CLI             |
-| `prisma-ydb/control`     | Native schema and migration components                    |
+| `prisma-ydb/control`     | Native schema, migrations and `generateYql`               |
 | `prisma-ydb/environment` | `ydbBindingFromEnv` for SDK auth/TLS conventions          |
 
 The root export contains the runtime factory and low-level driver. Control-plane
 code is also available through an explicit subpath. Generated contracts are
 consumed through the package's YDB contract serializer.
+
+## Typed native queries
+
+`prisma-ydb yql generate` compiles `prisma/yql/*.yql` into typed functions using
+YDB EXPLAIN result types. `--check` detects stale generated files without writing.
+The programmatic `generateYql({ config?, dir?, output?, check? })` lives in
+`prisma-ydb/control`. Configure paths with `defineYdbConfig({ ..., yql: { dir,
+output } })` or CLI flags. The runtime exports `defineYql<Params, Result>`;
+generated functions call `fn(dbOrTx, params, { signal?, timeoutMs?, commit? })`.
+Timestamp results are bigint microseconds; optional inputs may be omitted as NULL.
+See [Typed YQL files](yql.md#typed-yql-files) for supported types and result shapes.
+
+Dynamic `yqlStatement({ params, results?, text })` returns the same callable shape
+with `.text`, and compiles once at definition. Scalar result descriptors decode a
+single-column row. Required, unknown and unused parameters are checked. Use
+`optional`, `list`, `struct`, `columns` and model `extra` members when assembling
+statements. The old contract argument, bound client/transaction factories,
+`fields` and `withColumns` have been removed.
 
 ## Client
 
@@ -336,7 +354,7 @@ rows is written as `NULL` for the others (nullable fields only). Column tables
 require every column per row, so their uploads always carry the full row. Like
 raw YQL, it bypasses `temporal.*` presets and client-side referential actions.
 
-`db.changefeed(model, { consumer, feed?, limit?, waitMs?, partitionIds?, readFrom?, maxLagMs?, signal? })`
+`db.changefeed(model, { consumer, fields?, feed?, limit?, waitMs?, partitionIds?, readFrom?, maxLagMs?, signal? })`
 reads a managed `@@changefeed` topic (`format: Json`) and yields batches of
 decoded events:
 
@@ -352,7 +370,10 @@ for await (const batch of db.changefeed('Order', { consumer: 'app' })) {
 Values are decoded with the model's codecs: `BigInt`/`Uint64` as exact `bigint`
 (YDB writes them as bare JSON numbers, which are parsed from their source text,
 never through doubles), `Decimal` as a string, `Date` as `YYYY-MM-DD`, lists as
-arrays. Unmapped columns are ignored. `event.raw` keeps the server record with
+arrays. `fields: ["note", "status"]` decodes only those model fields plus every
+primary key field, including images and updates; `fields: []` keeps only keys.
+Unselected fields remain available through lazy `event.raw`. Projection is compiled
+once per reader. Unmapped columns are ignored. `event.raw` keeps the server record with
 integers beyond `Number.MAX_SAFE_INTEGER` as decimal strings. It is computed
 on first access, cached, and remains enumerable for serialization. `event.ts` is set
 only when the feed records virtual timestamps. `feed` is required when the model
@@ -389,6 +410,42 @@ exception thrown by a hook ends the iteration with that error. Committing a batc
 of a partition that has since been taken away rejects with an `Error`; its
 messages are redelivered to the partition's next reader.
 
+The start-hook partition and every batch partition expose `stop(reason?)`,
+`pause()` and `resume()`, plus `stopped`, `paused` and `stopReason`. Stop refuses
+that assignment without ending the iterator, drops buffered records and prevents
+future commits through its handles. Direct `commit()`, `commitThrough()` and
+`skip()` calls on a stopped handle reject with an `Error` naming the stop reason;
+`batch.commit()` skips stopped partitions. Call it in `onPartitionStart` to refuse a gap
+without throwing. Pause buffers future delivery until resumed; already yielded
+events remain yours to process. Buffering uses `maxBufferBytes` (default 16 MiB);
+once this budget is reached, the reader applies backpressure until a paused
+partition resumes or stops. Other partitions continue while buffer space remains. Pause is a short local
+hold; use `stop()` for long refusal so a paused backlog cannot stall other partitions.
+
+```ts
+for await (const batch of db.changefeed('Order', {
+  consumer: 'app',
+  fields: ['status'],
+  onPartitionStart: (partition) => {
+    if (partition.retentionExpired) partition.stop('needs backfill');
+  },
+})) {
+  for (const partition of batch.partitions) {
+    for (const event of partition.events) {
+      if (isPoison(event)) {
+        await deadLetter(event);
+        await partition.skip(event);
+      } else await apply(event);
+    }
+    await partition.commit();
+  }
+}
+```
+
+`commitThrough(event)` and its alias `skip(event)` explicitly acknowledge all
+offsets through that decoded event, inclusive. Process or quarantine every earlier
+event first. Events must belong to that partition batch. A stopped handle rejects new direct commits; an acknowledgement already sent before stop may still arrive.
+
 Batches also expose `partitions`, each with `partitionId`, `partitionSessionId`,
 `events`, `errors` and `commit()`. A malformed record becomes an error entry
 `{ partitionId, partitionSessionId, offset, error, payload }`; it does not end the
@@ -398,8 +455,10 @@ while other partitions continue. `batch.commit()` acknowledges only groups with
 no errors; a partition group's `commit()` acknowledges its decoded prefix only,
 never the failed record or anything after it. Process that prefix before committing.
 
-`@ydbjs/topic` 6.1.4 has no reader method to pause one partition. Quarantine is
-client-side, so it still consumes network bandwidth. A new assignment retries
+`@ydbjs/topic` 6.1.4 has no public reader method to release a single partition
+assignment to the server. Its session `stop()` only changes local state. Refusal
+and quarantine are therefore client-side and still consume network bandwidth;
+another reader can take the partition after server reassignment or reader closure. A new assignment retries
 from the stored consumer offset. To explicitly skip a repaired/dead-lettered
 record, close the iterator and restart it with `onPartitionStart` returning
 `{ readOffset: badOffset + 1n, commitOffset: badOffset + 1n }` for that partition.
@@ -427,11 +486,11 @@ Close readers and writers you create before closing `db`. The exported
 | `Uuid`          | `Uuid`          | canonical lowercase UUID `string`          |
 | `String`        | `Utf8`          | `string`                                   |
 | `Int`           | `Int32`         | checked integer `number`                   |
-| `BigInt`        | `Int64`         | range-checked `bigint`                     |
+| `BigInt`        | `Int64`         | `bigint` output; safe integer number input |
 | `Uint64`        | `Uint64`        | range-checked unsigned `bigint`            |
 | `Boolean`       | `Bool`          | `boolean`                                  |
 | `Float`         | `Double`        | finite `number`                            |
-| `DateTime`      | `Timestamp`     | `Date`; truncates to milliseconds          |
+| `DateTime`      | `Timestamp`     | `Date` output; exact bigint micros input   |
 | `Date`          | `Date`          | UTC calendar string `YYYY-MM-DD`           |
 | `Timestamp`     | `Timestamp`     | UTC ISO string with six fractional digits  |
 | `Json`          | `Json`          | JSON values, including scalar strings/null |
@@ -440,8 +499,21 @@ Close readers and writers you create before closing `db`. The exported
 | `Decimal(p, s)` | `Decimal(p,s)`  | exact decimal `string`                     |
 
 ORM `DateTime` decoding, including relation includes, truncates microseconds to
-milliseconds. Its writes use JavaScript `Date` values. Native
-relation formatting preserves fractional seconds before ORM decoding.
+milliseconds. Native relation formatting preserves fractional seconds before
+ORM decoding. DateTime writes accept a `Date`, exact `bigint` microseconds, or a
+`TimestampMicrosValue`, including ORM mutations, `yqlModel` and `bulkUpsert`.
+All forms validate the YDB range. DateTime ORM results remain `Date` values;
+use the `Timestamp` schema scalar for exact ORM reads, or a native model with
+`micros: ['fieldName']` for bigint results. Int64 and Uint64 inputs accept safe
+integer numbers and convert them to bigint; unsafe numbers remain errors.
+
+`ydbDecimal.with(precision, scale)` returns a regular descriptor with `yqlType`,
+`wire(value)`, `wireType()` and `nativeConversions()`. The unparameterized
+`ydbDecimal` and schema `typeParams` retain their `(22,9)` default behavior.
+Every scalar descriptor exposes a cached protobuf `wireType()` without a value.
+`optional`, `list` and `struct` compose descriptors, including typed NULLs and
+empty lists. See [typed native YQL](yql.md) for examples.
+
 Raw Timestamp values preserve microseconds as `bigint`. Raw Decimal values
 preserve exact decimal strings; native `DecimalValue` accepts explicit precision
 and scale up to YDB's precision limit of 35. Non-finite decimals and nonzero

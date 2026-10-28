@@ -148,5 +148,8 @@
         }
       }
     }
+  },
+  "bin": {
+    "prisma-ydb": "./dist/cli.js"
   }
 }

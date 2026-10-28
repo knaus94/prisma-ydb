@@ -1,3 +1,6 @@
+import { ExecMode, StatsMode } from '@ydbjs/api/query';
+import { Session } from '../driver/session.js';
+import { checkStatus } from '../driver/errors.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { SqlControlDriverInstance } from '@prisma/orm-family-sql/contract/types';
 import type { ControlDriverDescriptor } from '@prisma/orm-framework/components/control';
@@ -19,6 +22,42 @@ export class YdbControlDriver implements SqlControlDriverInstance<'ydb'> {
   }
   async close(): Promise<void> {
     await this.native.close();
+  }
+  /** Control-only type inference: QueryService EXPLAIN never executes the query. */
+  async explainYql(text: string): Promise<{ ast: string; plan: string }> {
+    const scope = new AbortController();
+    const timeout = setTimeout(
+      () => scope.abort(new Error('YQL EXPLAIN timed out')),
+      30_000,
+    );
+    let session: Session | undefined;
+    try {
+      session = await Session.open({
+        core: this.core,
+        signal: scope.signal,
+        closeTimeoutMs: 5000,
+        maxWaiters: 1,
+      });
+      let ast = '',
+        plan = '';
+      for await (const part of session.client.executeQuery(
+        {
+          sessionId: session.id,
+          execMode: ExecMode.EXPLAIN,
+          statsMode: StatsMode.FULL,
+          query: { case: 'queryContent', value: { syntax: 1, text } },
+        },
+        { signal: scope.signal },
+      )) {
+        checkStatus(part);
+        if (part.execStats?.queryAst) ast = part.execStats.queryAst;
+        if (part.execStats?.queryPlan) plan = part.execStats.queryPlan;
+      }
+      return { ast, plan };
+    } finally {
+      clearTimeout(timeout);
+      await session?.close();
+    }
   }
   async databaseName(): Promise<string> {
     return this.core.database;

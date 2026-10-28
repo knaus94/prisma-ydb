@@ -365,3 +365,163 @@ test(
     );
   },
 );
+
+test(
+  'changefeed partition controls isolate delivery, skip poison and project fields',
+  { timeout: 120_000 },
+  async (context) => {
+    const fixture = await createFixture(context, {
+      schema: (table) =>
+        [
+          '// use prisma-8',
+          'model Event {',
+          '  shard Uint64',
+          '  id String',
+          '  note String',
+          '  ignored String',
+          '  @@id([shard, id])',
+          `  @@map("${table('Event')}")`,
+          '  @@changefeed("history", mode: NewImage, format: Json, retention: "P1D", partitions: 2, autoPartitioning: false, consumers: ["app", "probe"])',
+          '}',
+        ].join('\n'),
+    });
+    const planned = await fixture.prisma([
+      'migration',
+      'plan',
+      '--from',
+      '@empty',
+      '--name',
+      'initial',
+    ]);
+    assert.equal(planned.code, 0, planned.stdout + planned.stderr);
+    const migrated = await fixture.prisma(['db', 'migrate']);
+    assert.equal(migrated.code, 0, migrated.stdout + migrated.stderr);
+    const { db } = fixture;
+    const high = 18446744073709551615n;
+    for (const [shard, id] of [
+      [0n, 'bad'],
+      [high, 'healthy-1'],
+    ] as const) {
+      await db.orm.Event.create({
+        shard,
+        id,
+        note: 'first',
+        ignored: 'wide payload',
+      });
+      await db.orm.Event.where({ shard, id }).update({ note: 'second' });
+    }
+    // Assignment ids are server-owned; discover the key-to-partition mapping first.
+    const observed: YdbChangeEvent[] = [];
+    for await (const batch of db.changefeed('Event', {
+      consumer: 'probe',
+      fields: [],
+      waitMs: 100,
+      signal: AbortSignal.timeout(30_000),
+    })) {
+      observed.push(...batch.events);
+      if (observed.length === 4) break;
+    }
+    const refusedId = observed.find(
+      (event) => event.key.shard === 0n,
+    )!.partition!;
+    assert.notEqual(
+      refusedId,
+      observed.find((event) => event.key.shard === high)!.partition,
+    );
+
+    let resumed = false;
+    let refused: YdbChangefeedPartition | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const healthy: YdbChangeEvent[] = [];
+    try {
+      for await (const batch of db.changefeed('Event', {
+        consumer: 'app',
+        fields: ['note'],
+        waitMs: 100,
+        signal: AbortSignal.timeout(30_000),
+        onPartitionStart(partition) {
+          if (partition.partitionId === refusedId) {
+            refused = partition;
+            partition.stop('retention policy');
+          } else {
+            partition.pause();
+            assert.equal(partition.paused, true);
+            timer = setTimeout(() => {
+              resumed = true;
+              partition.resume();
+            }, 200);
+          }
+        },
+      })) {
+        assert.equal(resumed, true);
+        healthy.push(...batch.events);
+        assert.ok(batch.events.every((event) => event.key.shard === high));
+        await batch.commit();
+        if (healthy.length === 2) break;
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(refused?.stopped, true);
+    assert.equal(refused?.stopReason, 'retention policy');
+    assert.equal(healthy.length, 2);
+    assert.deepEqual(healthy[0]?.newImage, {
+      shard: high,
+      id: 'healthy-1',
+      note: 'first',
+    });
+
+    // A service can identify poison after decoding and checkpoint exactly through it.
+    let poison: YdbChangeEvent | undefined;
+    for await (const batch of db.changefeed('Event', {
+      consumer: 'app',
+      fields: [],
+      partitionIds: [refusedId],
+      waitMs: 100,
+      signal: AbortSignal.timeout(30_000),
+      onPartitionStart(partition) {
+        assert.equal(partition.committedOffset, 0n);
+      },
+    })) {
+      const partition = batch.partitions[0]!;
+      poison = partition.events[0];
+      assert.equal(poison?.offset, 0n);
+      assert.deepEqual(poison?.newImage, { shard: 0n, id: 'bad' });
+      await partition.skip(poison!);
+      partition.stop('quarantine remaining events');
+      await assert.rejects(
+        partition.commit(),
+        /Changefeed partition stopped: quarantine remaining events/,
+      );
+      await assert.rejects(
+        partition.skip(poison!),
+        /Changefeed partition stopped/,
+      );
+      await batch.commit();
+      break;
+    }
+    let afterPoison: YdbChangeEvent | undefined;
+    for await (const batch of db.changefeed('Event', {
+      consumer: 'app',
+      partitionIds: [refusedId],
+      waitMs: 100,
+      signal: AbortSignal.timeout(30_000),
+      onPartitionStart(partition) {
+        assert.equal(partition.committedOffset, 1n);
+      },
+    })) {
+      const partition = batch.partitions[0]!;
+      afterPoison = partition.events[0];
+      partition.pause();
+      assert.equal(partition.paused, true);
+      partition.resume();
+      assert.equal(partition.paused, false);
+      await assert.rejects(partition.commitThrough(poison!), /does not belong/);
+      await partition.commitThrough(afterPoison!);
+      break;
+    }
+    assert.equal(afterPoison?.offset, 1n);
+    assert.equal(afterPoison?.key.id, 'bad');
+    assert.equal(afterPoison?.newImage?.note, 'second');
+  },
+);

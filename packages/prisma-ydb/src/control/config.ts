@@ -320,6 +320,7 @@ export const ydbControlAdapterDescriptor: ControlAdapterDescriptor<
 };
 
 export interface YdbConfigOptions {
+  readonly yql?: { readonly dir?: string; readonly output?: string };
   readonly contract: string;
   readonly output?: string;
   readonly db?: { readonly connection?: YdbBinding | string };
@@ -328,9 +329,13 @@ export interface YdbConfigOptions {
   readonly relationMode?: 'application';
 }
 
-export function defineYdbConfig(
-  options: YdbConfigOptions,
-): PrismaNextConfig<'sql', 'ydb', string> {
+export function defineYdbConfig(options: YdbConfigOptions): PrismaNextConfig<
+  'sql',
+  'ydb',
+  string
+> & {
+  readonly yql?: YdbConfigOptions['yql'];
+} {
   if (
     options.relationMode !== undefined &&
     options.relationMode !== 'application'
@@ -357,6 +362,7 @@ export function defineYdbConfig(
       ),
   };
   return {
+    ...(options.yql ? { yql: options.yql } : {}),
     family: ydbSqlFamily,
     target: ydbControlTarget,
     adapter: ydbControlAdapterDescriptor,

@@ -183,3 +183,80 @@ regression suite in this extracted project.
 
 Official references: [YDB JS SDK](https://github.com/ydb-platform/ydb-js-sdk),
 [local YDB configuration](https://ydb.tech/docs/en/reference/docker/configuration).
+
+## Composite key lists
+
+Use the exported `whereKeys` predicate in a native ORM `where` callback:
+
+```ts
+import { whereKeys } from 'prisma-ydb/runtime';
+
+const rows = await db.orm.Wallet.where((wallet) =>
+  whereKeys(wallet, [
+    { userKey: 3198191471355371895n, userId: 'alice', kind: 1 },
+    { userKey: 3198191471355371895n, userId: 'bob', kind: 2 },
+  ]),
+).all();
+```
+
+Fields must follow the primary key or a secondary index's leading column order;
+key-object field order must follow the declared key/index column order, and
+all rows must supply the same fields, with nonnull scalar values. A matching
+secondary index is selected automatically for reads, preferring the shortest
+index and then declaration order; explicit `ydbView` annotations take precedence.
+Primary-key prefixes use the table directly. Updates/deletes also accept primary-key
+prefixes; secondary-index tuple predicates are rejected for mutations. The compiler emits tuple membership
+against one typed `List<Tuple<...>>` parameter, preserving exact 64-bit keys.
+An empty list compiles to `FALSE` without a parameter. Keep key batches bounded
+by the query's parameter and result-size limits; split large lists into batches
+and measure query latency rather than building unbounded request payloads.
+
+## Index selection and bounded scans
+
+Select a top-level secondary index through Prisma's native read annotation:
+
+```ts
+import { ydbView } from 'prisma-ydb/runtime';
+
+const rows = await db.orm.Operation.where({ ownerId })
+  .orderBy((operation) => operation.createdAt.desc())
+  .all((meta) => meta.annotate(ydbView('operation_by_created')));
+```
+
+The index must exist on the query's root table. Invalid names are rejected before
+execution, and prepared statements retain the compiled view. The ordinary query
+path adds only an annotation check; AST cloning occurs only for annotated reads.
+Index reads retain the index's configured freshness: asynchronous indexes may lag.
+
+For history pages with residual filters, use `db.scanIndex` (also on `tx`):
+
+```ts
+const page = await db.scanIndex('Operation', {
+  index: 'operation_by_created',
+  equal: { ownerId },
+  direction: 'desc',
+  budget: 100,
+  select: ['id', 'createdAt', 'status'],
+  after: previousPage?.lastKey,
+  accept: (row) => row.status === 'settled',
+});
+// page.rows, page.inspected, page.lastKey, page.exhausted
+```
+
+`equal` must be a nonempty leading index prefix. The cursor contains the remaining
+index fields followed by primary-key fields absent from the index/prefix. Reuse
+`lastKey` with the same index, equality prefix and direction. Ordering and the
+cursor use model field names, including mapped columns. Index and key columns
+must be nonnullable scalars. The helper selects at most `budget` candidate rows
+before running the synchronous `accept` predicate; `inspected` counts candidates,
+even if all are rejected, and `lastKey` identifies the last candidate scanned.
+`select` bounds returned fields; cursor fields are transferred internally as well.
+The budget caps candidate rows fetched, not the server's internal storage work or
+index-to-table lookups; inspect EXPLAIN and statistics for those costs.
+`exhausted` is true only when fewer than `budget` candidates were fetched. An
+exactly full final page needs a further read to discover exhaustion. Separate
+calls use separate snapshots; use a read-only transaction for a consistent scan.
+
+Changefeed `pause()` is a short local hold. Its buffer shares a finite byte budget;
+when that budget fills, healthy partitions also wait. Use partition `stop()` for
+long refusal/quarantine, allowing other partitions to keep draining.

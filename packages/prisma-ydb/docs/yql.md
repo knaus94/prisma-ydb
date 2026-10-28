@@ -3,6 +3,91 @@
 One client exposes ORM queries, a typed SQL builder and native YQL. Native
 requests use YDB QueryService directly.
 
+## Typed YQL files
+
+Write plain YQL in `prisma/yql/*.yql`, relative to your Prisma config. Declare
+every parameter in the file. Generate TypeScript against the same database schema
+that the application will query:
+
+```sql
+-- prisma/yql/task-history.yql
+DECLARE $projectId AS Utf8;
+SELECT id, title, updatedAt FROM `Task`
+WHERE projectId = $projectId ORDER BY id LIMIT 50;
+SELECT COUNT(*) AS total FROM `Task` WHERE projectId = $projectId;
+```
+
+```sh
+prisma-ydb yql generate
+prisma-ydb yql generate --check
+prisma-ydb yql generate --config ./prisma.config.ts --dir ./prisma/yql --output ./src/generated/yql.ts
+```
+
+The default output is `yql.ts` beside `contract.output` (Prisma represents that
+setting as the `contract.json` file). `defineYdbConfig` also accepts
+`yql: { dir: './prisma/yql', output: './src/generated/yql.ts' }`. All paths are
+relative to the config directory. CLI flags override config and remain the
+fallback for config-loader versions that reject custom sections.
+
+`--check` compares the regenerated file byte for byte and fails if missing or
+stale, without writing it. Exclude generated `yql.ts` files from formatters;
+this repository already excludes `**/generated`. Commit the generated file and
+run generation after migrations before checking it in CI.
+
+```ts
+import { taskHistory } from './generated/yql.js';
+
+const [tasks, summary] = await taskHistory(
+  db,
+  { projectId },
+  { timeoutMs: 5000 },
+);
+await db.transaction(async (tx) => {
+  const [rows] = await taskHistory(tx, { projectId });
+  console.log(rows[0]?.updatedAt); // bigint microseconds, nullable if the column is nullable
+});
+```
+
+File names become camelCase function names (`task-history.yql` → `taskHistory`).
+Invalid identifiers, reserved words and generated-name collisions fail generation.
+Each function exports its `XParams`, `XRow` (or `XRow1`, `XRow2`, …) and `XResult`
+types. One result set returns a row array, several return a tuple of row arrays,
+and no result sets return `void`. Columns decode by name, independent of AST
+member ordering. Calls accept `db` or `tx`, with `signal`, `timeoutMs` and `commit`
+options. Required parameters must be present; optional parameters may be omitted
+and encode as NULL. Unknown keys are rejected.
+
+| YQL type                               | Generated input                    | Generated output    |
+| -------------------------------------- | ---------------------------------- | ------------------- |
+| Bool                                   | boolean                            | boolean             |
+| Int8/16/32, Uint8/16/32, Float, Double | number                             | number              |
+| Int64, Uint64                          | bigint or safe-integer number      | bigint              |
+| Utf8, Uuid                             | string                             | string              |
+| String                                 | Uint8Array                         | Uint8Array          |
+| Decimal(p,s)                           | exact string                       | exact string        |
+| Date                                   | YYYY-MM-DD string                  | YYYY-MM-DD string   |
+| Timestamp                              | Date, bigint, TimestampMicrosValue | bigint microseconds |
+| Json, JsonDocument                     | JsonValue                          | JsonValue           |
+| Optional<T> / T?                       | T, null, undefined (key optional)  | T or null           |
+| List<T>                                | readonly array                     | array               |
+| Tuple<…>                               | readonly tuple                     | tuple               |
+| Struct<…>                              | object                             | object              |
+
+Datetime, Interval, extended 64-bit date types, Dict, Variant, Tagged, Yson and
+other unsupported types fail generation with the file and type name. Timestamp
+always means exact microseconds since the Unix epoch; converting it to `Date`
+discards sub-millisecond precision.
+
+The generator uses QueryService **EXPLAIN**, never EXECUTE. It parses parameter
+`DECLARE`s and infers result types from the physical query's result bindings in
+`execStats.queryAst`, resolving aliases and cross-checking the result count with
+the JSON query plan. This depends on the AST format of pinned YDB 26.2.1.14;
+revalidate on upgrades. Unknown plan shapes fail loudly instead of guessing.
+YDB diagnostics include the source file. Unused parameter declarations also fail,
+catching typos before generation. Runtime type parsing and codec compilation run
+once at module load, outside the per-call path. Generator modules are exported
+only through `prisma-ydb/control` and the CLI, keeping them out of the runtime.
+
 ## Bind parameters
 
 ```ts
@@ -236,3 +321,95 @@ try {
 Official references: [YQL](https://ydb.tech/docs/en/yql/reference/),
 [YQL primitive types](https://ydb.tech/docs/en/yql/reference/types/primitive),
 [YDB JS SDK](https://github.com/ydb-platform/ydb-js-sdk).
+
+## Value-free descriptors and exact clocks
+
+Every YDB codec descriptor has a cached `wireType()` returning its protobuf
+Type. Compose types once and encode values without dummy scalar values:
+
+```ts
+import {
+  optional,
+  list,
+  struct,
+  ydbUuid,
+  ydbDecimal,
+} from 'prisma-ydb/runtime';
+
+const price = ydbDecimal.with(12, 2);
+const owner = optional(ydbUuid);
+const items = list(struct({ owner, price }));
+const typedNull = owner.wire(null);
+const emptyItems = items.wire([]);
+```
+
+Containers expose the same `yqlType`, `wireType()`, `wire(value)` and
+`nativeConversions()` methods. `optional` accepts null or undefined and decodes
+NULL to null. `struct` rejects unknown and missing members. Int64/Uint64 inputs
+also accept safe integer numbers, converted to bigint; outputs remain bigint.
+
+DateTime writes accept `Date | bigint | TimestampMicrosValue` through model
+rows, bulk uploads and ORM mutations. Bigints mean exact microseconds since the
+Unix epoch, validated in YDB's 1970–2105 range. To retain exact model results:
+
+```ts
+const clock = db.yqlModel('Task', {
+  fields: ['id', 'updatedAt'],
+  micros: ['updatedAt'],
+  extra: { owner: ydbUuid },
+});
+// updatedAt decodes to bigint; owner is encoded and decoded as a synthetic member.
+```
+
+`micros` requires selected scalar Timestamp fields. `extra` names must be valid
+identifiers and cannot collide with any model field or physical column.
+DateTime ORM results remain JavaScript Dates. In the pinned Prisma 8 ORM,
+`Collection.select` accepts field names and provides no per-query codec or
+computed-expression projection. Use the `Timestamp` scalar (`ydb/timestamp-us@1`)
+for exact ORM columns. The separate native SQL builder supports raw computed
+projections; it does not change DateTime model result types.
+
+`nativeCodecConversions(codecId, typeParams?)` exposes synchronous native and
+JSON encode/decode functions. Resolve these once outside row loops.
+`timestampFromMicros(bigint)` formats six-digit UTC text;
+`timestampMicros(textOrDate)` parses UTC text or a Date into bigint microseconds;
+`timestampText(textOrDate)` normalizes six-digit UTC text. All validate the YDB
+range. These helpers are public runtime exports.
+
+## Dynamic statements
+
+For dynamically assembled statements, compile a standalone statement once at
+module scope. These descriptor types are authored by you; use Typed YQL files
+when you want the database to infer and verify result types.
+
+```ts
+import { yqlStatement, yqlModel, ydbInt64 } from 'prisma-ydb/runtime';
+
+const task = yqlModel(contract, 'Task', { fields: ['id', 'title'] });
+const load = yqlStatement({
+  params: { limit: ydbInt64 },
+  results: { tasks: task },
+  text: `SELECT * FROM ${task.table} LIMIT $limit;`,
+});
+const result = await load(db, { limit: 50 });
+await db.transaction(async (tx) => load(tx, { limit: 10n }));
+console.log(load.text); // Includes generated DECLAREs.
+```
+
+`params` accepts scalar descriptors, `optional`, `list`, `struct` and `yqlModel`
+handles. Declarations are generated automatically: do not put `DECLARE` in the
+text. Missing, unknown and unused parameters fail. Typed NULLs and empty lists
+retain their wire types.
+
+`results` names result sets in JavaScript property iteration order. Each entry
+accepts a model decoder, a struct descriptor, a plain codec field map, or a scalar
+descriptor. Scalars decode the sole column of each row and reject rows with any
+other column count. Use `yqlModel(..., { extra })` for synthetic typed columns.
+Omit `results` to receive the native buffered `YdbQueryResult`; `{}` requires no
+result sets. A result-set count mismatch throws.
+
+The returned callable is `statement(target, values, options?)` with `.text`.
+Options forward native cancellation, timeout and transaction settings. There are
+no `db.yqlStatement` or `tx.yqlStatement` factories. `columns(model, alias?)`
+renders safely quoted physical columns. Use `struct` for descriptor fields;
+`fields` and `withColumns` were removed.

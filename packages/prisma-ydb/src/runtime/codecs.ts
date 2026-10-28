@@ -1,5 +1,12 @@
 import { create } from '@bufbuild/protobuf';
-import { ValueSchema, type Value as WireValue } from '@ydbjs/api/value';
+import {
+  TypeSchema,
+  ValueSchema,
+  type Type as WireType,
+  type Value as WireValue,
+} from '@ydbjs/api/value';
+import { parameterType } from '../driver/values.js';
+import type { YdbParameter } from '../driver/types.js';
 import { bigIntsFromUuid } from '@ydbjs/value/uuid';
 import {
   CodecDescriptorImpl,
@@ -21,7 +28,6 @@ import {
   Int64,
   Json,
   Text,
-  Timestamp,
   Date as YdbDate,
   Uint64,
 } from '@ydbjs/value/primitive';
@@ -86,6 +92,7 @@ export class YdbCodecDescriptor<
   Traits extends readonly CodecTrait[],
   T,
 > extends CodecDescriptorImpl {
+  private cachedWireType?: WireType;
   readonly paramsSchema = undefined;
   readonly dataType;
   constructor(
@@ -112,11 +119,22 @@ export class YdbCodecDescriptor<
   wire(value: unknown): Value {
     return this.conversion.wire(this.conversion.read(value));
   }
+  wireType(): WireType {
+    return (this.cachedWireType ??= parameterType(this.yqlType));
+  }
   fromJson(value: JsonValue): T {
     return this.conversion.fromJson(value);
   }
   /** Resolve conversions once for native model row loops. */
   nativeConversions(): NativeCodecConversions {
+    if (this.codecId === 'ydb/decimal@1') {
+      const params = /^Decimal\((\d+),(\d+)\)$/.exec(this.yqlType);
+      if (!params) throw new TypeError('Invalid Decimal descriptor type');
+      return nativeCodecConversions(this.codecId, {
+        precision: Number(params[1]),
+        scale: Number(params[2]),
+      });
+    }
     const conversion = this.conversion;
     const decode = conversion.decode ?? conversion.read;
     return {
@@ -151,9 +169,11 @@ function assertInt32(value: unknown): number {
   return n;
 }
 function assertInteger(value: unknown, unsigned = false): bigint {
+  if (typeof value === 'number' && Number.isSafeInteger(value))
+    value = BigInt(value);
   if (typeof value !== 'bigint')
     throw new TypeError(
-      'Int64/Uint64 requires bigint; implicit number conversion is unsafe',
+      'Int64/Uint64 requires bigint or a safe integer number',
     );
   if (
     value < (unsigned ? 0n : -(1n << 63n)) ||
@@ -333,15 +353,32 @@ export const ydbTimestamp = new YdbCodecDescriptor(
   ['equality', 'order'] as const,
   'Timestamp',
   {
-    read: assertDate,
+    read: (value): Date | bigint | TimestampMicrosValue => {
+      if (typeof value === 'bigint') {
+        assertTimestampMicros(value);
+        return value;
+      }
+      if (value instanceof TimestampMicrosValue) {
+        assertTimestampMicros(value.value);
+        return value;
+      }
+      return assertDate(value);
+    },
     decode: (value) => {
       if (typeof value === 'bigint') {
+        assertTimestampMicros(value);
         return assertDate(new Date(Number(value / 1000n)));
       }
       return assertDate(value);
     },
-    wire: (value) => new Timestamp(value),
-    json: (value) => value.toISOString(),
+    wire: (value) => new TimestampMicrosValue(timestampInputMicros(value)),
+    json: (value) => {
+      if (value instanceof Date) return value.toISOString();
+      const micros = timestampInputMicros(value);
+      return micros % 1000n === 0n
+        ? new Date(Number(micros / 1000n)).toISOString()
+        : timestampFromMicros(micros);
+    },
     fromJson: timestampJson,
   },
   'Date',
@@ -422,6 +459,21 @@ export function decimalParams(value: unknown = {}): {
   return { precision, scale };
 }
 
+function assertTimestampMicros(value: bigint): void {
+  if (value < 0n || value >= 4291747200000000n)
+    throw new RangeError('Timestamp outside YDB range');
+}
+
+function timestampInputMicros(
+  value: Date | bigint | TimestampMicrosValue,
+): bigint {
+  return typeof value === 'bigint'
+    ? value
+    : value instanceof TimestampMicrosValue
+      ? value.value
+      : BigInt(value.getTime()) * 1000n;
+}
+
 class YdbDecimalDescriptor extends CodecDescriptorImpl<{
   precision?: number;
   scale?: number;
@@ -443,6 +495,35 @@ class YdbDecimalDescriptor extends CodecDescriptorImpl<{
       },
     },
   };
+  with(precision: number, scale: number) {
+    decimalText('0', precision, scale);
+    const read = (value: unknown) => decimalText(value, precision, scale);
+    return new YdbCodecDescriptor(
+      'ydb/decimal@1',
+      numeric,
+      `Decimal(${precision},${scale})`,
+      {
+        read,
+        wire: (value: string) => new DecimalValue(value, precision, scale),
+        json: read,
+        fromJson: read,
+      },
+      'string',
+    );
+  }
+  private defaultDescriptor?: ReturnType<YdbDecimalDescriptor['with']>;
+  private defaults() {
+    return (this.defaultDescriptor ??= this.with(22, 9));
+  }
+  wireType(): WireType {
+    return this.defaults().wireType();
+  }
+  wire(value: unknown): Value {
+    return this.defaults().wire(value);
+  }
+  nativeConversions(): NativeCodecConversions {
+    return nativeCodecConversions(this.codecId);
+  }
   override renderOutputType() {
     return 'string';
   }
@@ -534,13 +615,13 @@ export type CodecTypes = {
     traits: 'equality' | 'order' | 'numeric';
   };
   readonly 'ydb/int64@1': {
-    input: bigint;
+    input: bigint | number;
     output: bigint;
     json: string;
     traits: 'equality' | 'order' | 'numeric';
   };
   readonly 'ydb/uint64@1': {
-    input: bigint;
+    input: bigint | number;
     output: bigint;
     json: string;
     traits: 'equality' | 'order' | 'numeric';
@@ -564,7 +645,7 @@ export type CodecTypes = {
     traits: 'equality' | 'order' | 'numeric';
   };
   readonly 'ydb/timestamp@1': {
-    input: Date;
+    input: Date | bigint | TimestampMicrosValue;
     output: Date;
     json: string;
     traits: 'equality' | 'order';
@@ -658,7 +739,7 @@ export function encodeYdbJson(
   return codec.encodeJson(value as never);
 }
 
-interface NativeCodecConversions {
+export interface NativeCodecConversions {
   readonly decode: (value: unknown) => unknown;
   readonly encode: (value: unknown) => WireValue;
   readonly encodeJson: (value: unknown) => JsonValue;
@@ -738,7 +819,9 @@ function nativeWireEncoder(
         create(ValueSchema, {
           value: {
             case: 'uint64Value',
-            value: BigInt((read(value) as Date).getTime()) * 1000n,
+            value: timestampInputMicros(
+              read(value) as Date | bigint | TimestampMicrosValue,
+            ),
           },
         });
     case 'ydb/timestamp-us@1':
@@ -777,4 +860,160 @@ export function nativeCodecConversions(
   if (!codec || !(codec instanceof YdbCodecDescriptor))
     throw new TypeError(`YDB codec not registered: ${codecId}`);
   return codec.nativeConversions();
+}
+
+/** A value-free native parameter type with synchronous encoding and decoding. */
+export interface YdbTypeDescriptor<Input = unknown, Output = Input> {
+  readonly yqlType: string;
+  readonly __input?: Input;
+  readonly __output?: Output;
+  wireType(): WireType;
+  wire(value: Input): YdbParameter;
+  nativeConversions(): Pick<NativeCodecConversions, 'decode' | 'encode'>;
+}
+export type YdbTypeInput<D> = D extends {
+  readonly codecId: infer Id extends keyof CodecTypes;
+}
+  ? CodecTypes[Id]['input']
+  : D extends YdbTypeDescriptor<infer Input, unknown>
+    ? Input
+    : never;
+export type YdbTypeOutput<D> = D extends {
+  readonly codecId: infer Id extends keyof CodecTypes;
+}
+  ? CodecTypes[Id]['output']
+  : D extends YdbTypeDescriptor<unknown, infer Output>
+    ? Output
+    : never;
+
+function containerDescriptor<Input, Output>(
+  yqlType: string,
+  type: WireType,
+  encode: (value: Input) => WireValue,
+  decode: (value: unknown) => Output,
+): YdbTypeDescriptor<Input, Output> {
+  return {
+    yqlType,
+    wireType: () => type,
+    wire: (value) => ({ type, value: encode(value) }),
+    nativeConversions: () => ({
+      encode: (value) => encode(value as Input),
+      decode,
+    }),
+  };
+}
+
+export function optional<D extends YdbTypeDescriptor>(
+  item: D,
+): YdbTypeDescriptor<
+  YdbTypeInput<D> | null | undefined,
+  YdbTypeOutput<D> | null
+> {
+  const codec = item.nativeConversions();
+  const type = create(TypeSchema, {
+    type: { case: 'optionalType', value: { item: item.wireType() } },
+  });
+  const nullValue = create(ValueSchema, {
+    value: { case: 'nullFlagValue', value: 0 },
+  });
+  const nested = item.wireType().type.case === 'optionalType';
+  return containerDescriptor(
+    `Optional<${item.yqlType}>`,
+    type,
+    (value) =>
+      value == null
+        ? nullValue
+        : nested
+          ? create(ValueSchema, {
+              value: { case: 'nestedValue', value: codec.encode(value) },
+            })
+          : codec.encode(value),
+    (value) =>
+      value == null ? null : (codec.decode(value) as YdbTypeOutput<D>),
+  );
+}
+
+export function list<D extends YdbTypeDescriptor>(
+  item: D,
+): YdbTypeDescriptor<readonly YdbTypeInput<D>[], YdbTypeOutput<D>[]> {
+  const codec = item.nativeConversions();
+  const type = create(TypeSchema, {
+    type: { case: 'listType', value: { item: item.wireType() } },
+  });
+  return containerDescriptor(
+    `List<${item.yqlType}>`,
+    type,
+    (value) => {
+      if (!Array.isArray(value))
+        throw new TypeError('YQL list requires an array');
+      return create(ValueSchema, { items: value.map(codec.encode) });
+    },
+    (value) => {
+      if (!Array.isArray(value))
+        throw new TypeError('YQL list requires an array');
+      return value.map(codec.decode) as YdbTypeOutput<D>[];
+    },
+  );
+}
+
+export function struct<
+  const Fields extends Readonly<Record<string, YdbTypeDescriptor>>,
+>(
+  fields: Fields,
+): YdbTypeDescriptor<
+  { [Key in keyof Fields]: YdbTypeInput<Fields[Key]> },
+  { [Key in keyof Fields]: YdbTypeOutput<Fields[Key]> }
+> {
+  const entries = Object.entries(fields).map(([name, descriptor]) => {
+    if (
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) ||
+      ['__proto__', 'constructor', 'prototype'].includes(name)
+    )
+      throw new TypeError(`Invalid YQL struct member ${name}`);
+    return { name, descriptor, codec: descriptor.nativeConversions() };
+  });
+  const names = new Set(entries.map((entry) => entry.name));
+  const type = create(TypeSchema, {
+    type: {
+      case: 'structType',
+      value: {
+        members: entries.map(({ name, descriptor }) => ({
+          name,
+          type: descriptor.wireType(),
+        })),
+      },
+    },
+  });
+  const object = (value: unknown): Record<string, unknown> => {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+      throw new TypeError('YQL struct requires an object');
+    return value as Record<string, unknown>;
+  };
+  return containerDescriptor(
+    `Struct<${entries.map(({ name, descriptor }) => `\`${name}\`:${descriptor.yqlType}`).join(',')}>`,
+    type,
+    (value) => {
+      const row = object(value);
+      for (const name of Object.keys(row))
+        if (!names.has(name))
+          throw new TypeError(`Unknown YQL struct member ${name}`);
+      return create(ValueSchema, {
+        items: entries.map(({ name, codec }) => {
+          if (!Object.hasOwn(row, name))
+            throw new TypeError(`Missing YQL struct member ${name}`);
+          return codec.encode(row[name]);
+        }),
+      });
+    },
+    (value) => {
+      const row = object(value);
+      const result: Record<string, unknown> = {};
+      for (const { name, codec } of entries) {
+        if (!Object.hasOwn(row, name))
+          throw new TypeError(`Missing YQL struct member ${name}`);
+        result[name] = codec.decode(row[name]);
+      }
+      return result as { [Key in keyof Fields]: YdbTypeOutput<Fields[Key]> };
+    },
+  );
 }

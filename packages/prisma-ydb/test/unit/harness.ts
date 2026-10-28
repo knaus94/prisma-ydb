@@ -21,6 +21,7 @@ import {
 import { ydbContractSerializer } from 'prisma-ydb/control';
 import {
   compileYql,
+  ydbReadMiddleware,
   ydbRuntimeAdapter,
   ydbRuntimeDriver,
   ydbRuntimeTarget,
@@ -126,8 +127,14 @@ export function compileHarnessFromContract(contractJson: unknown) {
     driver: ydbRuntimeDriver,
   });
   const compiled: string[] = [];
-  const lower = (plan: SqlOrmPlan<unknown> | SqlQueryPlan) =>
-    compileYql((plan as SqlQueryPlan).ast, contract).sql;
+  const lower = async (plan: SqlOrmPlan<unknown> | SqlQueryPlan) => {
+    const query = plan as SqlQueryPlan;
+    const draft = await ydbReadMiddleware.beforeCompile!(
+      { ast: query.ast, meta: query.meta },
+      { contract } as never,
+    );
+    return compileYql(draft?.ast ?? query.ast, contract).sql;
+  };
   const samples: Record<string, unknown> = {
     'ydb/utf8@1': 'x',
     'ydb/uuid@1': '00000000-0000-0000-0000-000000000000',
@@ -169,16 +176,15 @@ export function compileHarnessFromContract(contractJson: unknown) {
   };
   const runtime: RuntimeQueryable = {
     query(plan) {
-      compiled.push(lower(plan));
-      const row = sampleRow(plan as SqlQueryPlan);
       return new AsyncIterableResult(
         (async function* () {
-          yield row;
+          compiled.push(await lower(plan));
+          yield sampleRow(plan as SqlQueryPlan);
         })(),
       );
     },
     async execute(plan) {
-      compiled.push(lower(plan));
+      compiled.push(await lower(plan));
       return { affectedRows: 0 };
     },
   };

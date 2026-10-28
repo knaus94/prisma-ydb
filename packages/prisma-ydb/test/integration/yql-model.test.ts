@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { yqlModel } from 'prisma-ydb/runtime';
+import { yqlModel, TimestampMicrosValue } from 'prisma-ydb/runtime';
 import { createFixture, quote } from './helpers.ts';
 
 test('yqlModel writes typed native rows and decodes them like ORM rows', async (context) => {
@@ -78,5 +78,33 @@ test('yqlModel writes typed native rows and decodes them like ORM rows', async (
       { id: 'first', n: 42 },
       { id: 'second', n: 2 },
     ],
+  );
+  const clock = yqlModel(db.contract, 'Item', {
+    fields: ['id', 'at'],
+    micros: ['at'],
+  });
+  const micros = 1_767_323_045_123_456n;
+  await db.yql(
+    `${clock.declare('row', 'struct')} UPDATE ${clock.table} ON SELECT * FROM AS_TABLE(AsList($row));`,
+    {
+      row: clock.row({ id: 'first', at: new TimestampMicrosValue(micros) }),
+    },
+  );
+  assert.deepEqual(
+    clock.decodeAll(
+      await db.yql(
+        `SELECT item_id, at FROM ${clock.table} WHERE item_id = 'first';`,
+      ),
+    ),
+    [{ id: 'first', at: micros }],
+  );
+  await db.orm.Item.where({ id: 'first' }).update({ at: micros + 1n });
+  assert.deepEqual(
+    clock.decodeAll(
+      await db.yql(
+        `SELECT item_id, at FROM ${clock.table} WHERE item_id = 'first';`,
+      ),
+    ),
+    [{ id: 'first', at: micros + 1n }],
   );
 });

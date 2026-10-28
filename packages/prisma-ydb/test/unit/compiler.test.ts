@@ -160,3 +160,112 @@ test('column-store mutations emulate RETURNING by key', async (context) => {
     );
   });
 });
+
+test('top-level index annotations and composite tuple-list lookups compile natively', async (context) => {
+  const { ydbView, whereKeys } = await import('prisma-ydb/runtime');
+  const harness = await compileHarness(
+    context,
+    [
+      '// use prisma-8',
+      'model Wallet {',
+      '  userKey Uint64',
+      '  userId String',
+      '  kind Int',
+      '  status String',
+      '  @@id([userKey, userId, kind])',
+      '  @@index([status, kind], map: "wallet_status")',
+      '  @@index([status], map: "wallet_status_short")',
+      '  @@index([status, userId], map: "wallet_status_tie")',
+      '  @@index([kind, status], map: "wallet_kind_first")',
+      '  @@index([kind, userId], map: "wallet_kind_second")',
+      '}',
+    ].join('\n'),
+  );
+  type Scope = Record<
+    string,
+    import('@prisma/orm-family-sql/relational-core/expression').Expression<
+      import('@prisma/orm-family-sql/relational-core/expression').ScopeField
+    >
+  >;
+  type Read = {
+    where(filter: ((scope: Scope) => unknown) | Record<string, unknown>): Read;
+    update(values: Record<string, unknown>): Promise<unknown>;
+    delete(): Promise<unknown>;
+    all(
+      configure?: (
+        meta: import('@prisma/orm-framework/components/runtime').MetaBuilder<'read'>,
+      ) => void,
+    ): Promise<unknown>;
+  };
+  const Wallet = harness.models['Wallet'] as Read;
+  const viewed = await harness.sql(() =>
+    Wallet.where({ status: 'open' }).all((meta) =>
+      meta.annotate(ydbView('wallet_status')),
+    ),
+  );
+  assert.match(viewed, /FROM `Wallet` VIEW `wallet_status`/);
+  await assert.rejects(
+    harness.sql(() => Wallet.all((meta) => meta.annotate(ydbView('missing')))),
+    /Unknown or unsupported YDB index/,
+  );
+  const keyed = await harness.sql(() =>
+    Wallet.where((scope) =>
+      whereKeys(scope, [
+        { userKey: 3198191471355371895n, userId: 'a', kind: 1 },
+        { userKey: 18446744073709551615n, userId: 'b', kind: 2 },
+      ]),
+    ).all(),
+  );
+  assert.doesNotMatch(keyed, /VIEW/);
+  assert.match(keyed, /DECLARE \$p1 AS List<Tuple<Uint64,\s*Utf8,\s*Int32>>/);
+  assert.match(
+    keyed,
+    /AsTuple\(`Wallet`\.`userKey`, `Wallet`\.`userId`, `Wallet`\.`kind`\) IN \$p1/,
+  );
+  const empty = await harness.sql(() =>
+    Wallet.where((scope) => whereKeys(scope, [])).all(),
+  );
+  assert.match(empty, /WHERE FALSE/);
+  assert.doesNotMatch(empty, /DECLARE/);
+  const indexed = await harness.sql(() =>
+    Wallet.where((scope) =>
+      whereKeys(scope, [{ status: 'open', kind: 1 }]),
+    ).all(),
+  );
+  assert.match(indexed, /VIEW `wallet_status`/);
+  const shortest = await harness.sql(() =>
+    Wallet.where((scope) => whereKeys(scope, [{ status: 'open' }])).all(),
+  );
+  assert.match(shortest, /VIEW `wallet_status_short`/);
+  const explicit = await harness.sql(() =>
+    Wallet.where((scope) => whereKeys(scope, [{ status: 'open' }])).all(
+      (meta) => meta.annotate(ydbView('wallet_status_tie')),
+    ),
+  );
+  assert.match(explicit, /VIEW `wallet_status_tie`/);
+  const tied = await harness.sql(() =>
+    Wallet.where((scope) => whereKeys(scope, [{ kind: 1 }])).all(),
+  );
+  assert.match(tied, /VIEW `wallet_kind_first`/);
+  await assert.rejects(
+    harness.sql(() =>
+      Wallet.where((scope) => whereKeys(scope, [{ userId: 'a' }])).all(),
+    ),
+    /primary key or index prefix/,
+  );
+  const updated = await harness.sql(() =>
+    Wallet.where((scope) =>
+      whereKeys(scope, [{ userKey: 1n, userId: 'a', kind: 1 }]),
+    ).update({ status: 'done' }),
+  );
+  assert.match(updated, /UPDATE `Wallet`/);
+  assert.match(updated, /WHERE.*`userKey`/);
+  assert.doesNotMatch(updated, /VIEW/);
+  const deleted = await harness.sql(() =>
+    Wallet.where((scope) =>
+      whereKeys(scope, [{ userKey: 1n, userId: 'a', kind: 1 }]),
+    ).delete(),
+  );
+  assert.match(deleted, /DELETE FROM `Wallet`/);
+  assert.doesNotMatch(deleted, /VIEW/);
+});

@@ -1,0 +1,2 @@
+DECLARE $id AS Utf8;
+SELECT id, name, budget FROM `Project` WHERE id = $id;

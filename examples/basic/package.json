@@ -179,6 +179,22 @@
             ]
           }
         ]
+      },
+      "yql-generate": {
+        "executor": "nx:run-commands",
+        "cache": false,
+        "dependsOn": [
+          {
+            "target": "build",
+            "projects": [
+              "prisma-ydb"
+            ]
+          }
+        ],
+        "options": {
+          "command": "node ../../packages/prisma-ydb/dist/cli.js yql generate",
+          "cwd": "{projectRoot}"
+        }
       }
     }
   },

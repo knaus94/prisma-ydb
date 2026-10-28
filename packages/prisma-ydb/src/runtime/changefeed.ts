@@ -7,11 +7,23 @@ import type { Contract } from '@prisma/orm-framework/contract/types';
 import type { JsonValue } from '@prisma/orm-framework/contract/types';
 import type { SqlStorage } from '@prisma/orm-family-sql/contract/types';
 import type { YdbDriver } from '../driver/driver.js';
-import { decodeYdbJson } from './codecs.js';
+import { nativeCodecConversions } from './codecs.js';
 import { resolveModel, type ModelColumn, type ResolvedModel } from './model.js';
 
+/** Local controls for one partition assignment. */
+export interface YdbChangefeedPartitionControl {
+  readonly stopped: boolean;
+  readonly paused: boolean;
+  readonly stopReason: unknown;
+  /** Quarantine this assignment permanently, without committing it. */
+  stop(reason?: unknown): void;
+  /** Buffer further delivery until resumed. */
+  pause(): void;
+  resume(): void;
+}
+
 /** One topic partition assigned to this reader. */
-export interface YdbChangefeedPartition {
+export interface YdbChangefeedPartition extends YdbChangefeedPartitionControl {
   readonly partitionId: bigint;
   /** Identifies this assignment; a reassigned partition gets a new session. */
   readonly partitionSessionId: bigint;
@@ -35,6 +47,8 @@ export interface YdbChangefeedStartPosition {
 export interface YdbChangefeedOptions {
   /** Topic consumer; declare it in `@@changefeed(consumers: [...])` or create it manually. */
   readonly consumer: string;
+  /** Decode only these model fields plus the full primary key. */
+  readonly fields?: readonly string[];
   /** Required when the model declares more than one changefeed. */
   readonly feed?: string;
   readonly signal?: AbortSignal;
@@ -100,13 +114,19 @@ export interface YdbChangefeedDecodeError {
   readonly payload: Uint8Array;
 }
 
-export interface YdbChangePartitionBatch<Row = Record<string, unknown>> {
+export interface YdbChangePartitionBatch<
+  Row = Record<string, unknown>,
+> extends YdbChangefeedPartitionControl {
   readonly partitionId: bigint;
   readonly partitionSessionId: bigint;
   readonly events: readonly YdbChangeEvent<Row>[];
   readonly errors: readonly YdbChangefeedDecodeError[];
   /** Acknowledge successfully decoded records before any decode failure. */
   commit(): Promise<void>;
+  /** Commit through this event, including all earlier offsets in this partition. */
+  commitThrough(event: YdbChangeEvent<Row>): Promise<void>;
+  /** Deliberately acknowledge a decoded poison event and its preceding offsets. */
+  skip(event: YdbChangeEvent<Row>): Promise<void>;
 }
 
 export interface YdbChangeBatch<Row = Record<string, unknown>> {
@@ -219,57 +239,70 @@ function codecJson(codecId: string, token: Token): JsonValue {
   return token;
 }
 
-function decodeField(column: ModelColumn, token: Token): unknown {
-  if (token === null) return null;
-  if (column.many) {
+function compileField(column: ModelColumn): (token: Token) => unknown {
+  const decode = nativeCodecConversions(
+    column.codecId,
+    column.typeParams,
+  ).decodeJson;
+  const scalar = (token: Token) => decode(codecJson(column.codecId, token));
+  return (token) => {
+    if (token === null) return null;
+    if (!column.many) return scalar(token);
     // Lists are stored as Json holding the elements' codec JSON forms.
     const list = typeof token === 'string' ? parseTokens(token) : token;
     if (!Array.isArray(list))
       throw new TypeError(
         `Changefeed list column ${column.column} is not an array`,
       );
-    return list.map((element) =>
-      decodeYdbJson(
-        column.codecId,
-        codecJson(column.codecId, element),
-        column.typeParams,
-      ),
-    );
-  }
-  return decodeYdbJson(
-    column.codecId,
-    codecJson(column.codecId, token),
-    column.typeParams,
+    return list.map(scalar);
+  };
+}
+
+/** Resolve projection and codec dispatch once per reader, outside the record loop. */
+function compileDecoder(model: ResolvedModel, fields?: readonly string[]) {
+  const selected =
+    fields === undefined
+      ? model.columns
+      : fields.map((field) => {
+          const column = model.byField.get(field);
+          if (!column)
+            throw new TypeError(
+              `Unknown changefeed field ${model.name}.${field}`,
+            );
+          return column;
+        });
+  const columns = [...new Set([...model.primaryKey, ...selected])].map(
+    (column) => ({
+      ...column,
+      decode: compileField(column),
+    }),
   );
-}
-
-function decodeImage(
-  model: ResolvedModel,
-  image: Token,
-): Record<string, unknown> {
-  if (typeof image !== 'object' || image === null || Array.isArray(image))
-    throw new TypeError('Changefeed image is not an object');
-  const row: Record<string, unknown> = {};
-  for (const name in image) {
-    if (!Object.hasOwn(image, name)) continue;
-    const value = (image as { [key: string]: Token })[name]!;
-    const column = model.byColumn.get(name);
-    if (column) row[column.field] = decodeField(column, value);
-  }
-  return row;
-}
-
-function decodeKey(
-  model: ResolvedModel,
-  key: Token | undefined,
-): Record<string, unknown> {
-  if (!Array.isArray(key) || key.length !== model.primaryKey.length)
-    throw new TypeError('Changefeed key does not match the primary key');
-  const row: Record<string, unknown> = {};
-  model.primaryKey.forEach((column, index) => {
-    row[column.field] = decodeField(column, key[index] ?? null);
-  });
-  return row;
+  const byColumn = new Map(columns.map((column) => [column.column, column]));
+  const keys = model.primaryKey.map((column) => byColumn.get(column.column)!);
+  return {
+    image(image: Token): Record<string, unknown> {
+      if (typeof image !== 'object' || image === null || Array.isArray(image))
+        throw new TypeError('Changefeed image is not an object');
+      const row: Record<string, unknown> = {};
+      for (const column of columns) {
+        if (Object.hasOwn(image, column.column))
+          row[column.field] = column.decode(
+            (image as Record<string, Token>)[column.column]!,
+          );
+      }
+      return row;
+    },
+    key(key: Token | undefined): Record<string, unknown> {
+      if (!Array.isArray(key) || key.length !== keys.length)
+        throw new TypeError('Changefeed key does not match the primary key');
+      const row: Record<string, unknown> = {};
+      for (let index = 0; index < keys.length; index++) {
+        const column = keys[index]!;
+        row[column.field] = column.decode(key[index] ?? null);
+      }
+      return row;
+    },
+  };
 }
 
 function virtualTimestamp(
@@ -308,20 +341,20 @@ const rawDescriptor: PropertyDescriptor = {
 };
 
 function decodeMessage(
-  model: ResolvedModel,
+  decoder: ReturnType<typeof compileDecoder>,
   message: TopicMessage,
 ): YdbChangeEvent {
   const tokens = parseTokens(textDecoder.decode(message.payload));
   if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens))
     throw new TypeError('Changefeed record is not an object');
   const record = tokens as Record<string, Token>;
-  const key = decodeKey(model, record['key']);
+  const key = decoder.key(record['key']);
   // Images carry non-key columns only; merge the key so they read as full rows.
   const image = (name: string) => {
     const value = record[name];
     return value === undefined || value === null
       ? undefined
-      : { ...key, ...decodeImage(model, value) };
+      : { ...key, ...decoder.image(value) };
   };
   const newImage = image('newImage');
   const oldImage = image('oldImage');
@@ -332,7 +365,7 @@ function decodeMessage(
     kind: 'erase' in record ? 'erase' : 'update',
     key,
     ...(updates !== undefined && updates !== null
-      ? { updates: decodeImage(model, updates) }
+      ? { updates: decoder.image(updates) }
       : {}),
     ...(newImage ? { newImage } : {}),
     ...(oldImage ? { oldImage } : {}),
@@ -355,15 +388,28 @@ type TopicPartitionSession = Parameters<
 function partitionOf(
   session: TopicPartitionSession,
   committedOffset: bigint,
+  control: YdbChangefeedPartitionControl,
 ): YdbChangefeedPartition {
-  return {
-    partitionId: session.partitionId,
-    partitionSessionId: session.partitionSessionId,
-    committedOffset,
-    startOffset: session.partitionOffsets?.start ?? 0n,
-    endOffset: session.partitionOffsets?.end ?? 0n,
-    retentionExpired: committedOffset < (session.partitionOffsets?.start ?? 0n),
-  };
+  return Object.assign(
+    Object.create(control) as YdbChangefeedPartitionControl,
+    {
+      partitionId: session.partitionId,
+      partitionSessionId: session.partitionSessionId,
+      committedOffset,
+      startOffset: session.partitionOffsets?.start ?? 0n,
+      endOffset: session.partitionOffsets?.end ?? 0n,
+      retentionExpired:
+        committedOffset < (session.partitionOffsets?.start ?? 0n),
+    },
+  );
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 /** Stream decoded change batches from a managed changefeed topic. */
@@ -375,6 +421,7 @@ export async function* readChangefeed(
   shutdown?: AbortSignal,
 ): AsyncIterable<YdbChangeBatch> {
   const model = resolveModel(contract, modelName);
+  const decoder = compileDecoder(model, options.fields);
   const feeds = model.options.changefeeds ?? [];
   const feed =
     options.feed === undefined
@@ -407,6 +454,55 @@ export async function* readChangefeed(
   // The SDK has no reader API to pause one partition. Drain quarantined
   // messages without decoding or committing them; reassignment replays them.
   const quarantined = new Map<bigint, bigint | undefined>();
+  const controls = new Map<bigint, YdbChangefeedPartitionControl>();
+  const pending = new Map<bigint, TopicMessage[]>();
+  let pendingBytes = 0n;
+  const pendingBudget = options.maxBufferBytes ?? 16n * 1024n * 1024n;
+  let wake = deferred();
+  const notify = () => {
+    wake.resolve();
+  };
+  const clearPending = (id: bigint) => {
+    for (const message of pending.get(id) ?? [])
+      pendingBytes -= BigInt(message.payload.byteLength);
+    pending.delete(id);
+  };
+  const controlFor = (session: TopicPartitionSession) => {
+    let control = controls.get(session.partitionSessionId);
+    if (!control) {
+      let stopped = false;
+      let paused = false;
+      let reason: unknown;
+      control = {
+        get stopped() {
+          return stopped || session.isStopped;
+        },
+        get paused() {
+          return paused;
+        },
+        get stopReason() {
+          return reason;
+        },
+        stop(value) {
+          if (stopped) return;
+          stopped = true;
+          reason = value;
+          paused = false;
+          clearPending(session.partitionSessionId);
+          notify();
+        },
+        pause() {
+          if (!stopped) paused = true;
+        },
+        resume() {
+          paused = false;
+          notify();
+        },
+      };
+      controls.set(session.partitionSessionId, control);
+    }
+    return control;
+  };
   for (const signal of [options.signal, shutdown]) {
     if (!signal) continue;
     if (signal.aborted) abort();
@@ -425,17 +521,14 @@ export async function* readChangefeed(
     ...(options.maxBufferBytes !== undefined
       ? { maxBufferBytes: options.maxBufferBytes }
       : {}),
-    async onPartitionSessionStart(session, committedOffset, offsets) {
+    async onPartitionSessionStart(session, committedOffset) {
       quarantined.delete(session.partitionSessionId);
       try {
-        const position = await onPartitionStart?.({
-          partitionId: session.partitionId,
-          partitionSessionId: session.partitionSessionId,
-          committedOffset,
-          startOffset: offsets.start,
-          endOffset: offsets.end,
-          retentionExpired: committedOffset < offsets.start,
-        });
+        const control = controlFor(session);
+        const position = await onPartitionStart?.(
+          partitionOf(session, committedOffset, control),
+        );
+        if (control.stopped) return undefined;
         if (!position) return undefined;
         // The SDK sends 0 for an omitted field, which would reset the
         // consumer; fill both from the server's current positions.
@@ -452,8 +545,11 @@ export async function* readChangefeed(
     },
     async onPartitionSessionStop(session, committedOffset) {
       quarantined.delete(session.partitionSessionId);
+      const control = controlFor(session);
+      control.stop();
+      controls.delete(session.partitionSessionId);
       try {
-        await onPartitionStop?.(partitionOf(session, committedOffset));
+        await onPartitionStop?.(partitionOf(session, committedOffset, control));
       } catch (error) {
         fail(error);
       }
@@ -462,7 +558,9 @@ export async function* readChangefeed(
       ? {
           onCommittedOffset(session, committedOffset) {
             try {
-              onCommitted(partitionOf(session, committedOffset));
+              onCommitted(
+                partitionOf(session, committedOffset, controlFor(session)),
+              );
             } catch (error) {
               fail(error);
             }
@@ -470,112 +568,205 @@ export async function* readChangefeed(
         }
       : {}),
   });
+  let source: AsyncIterator<TopicMessage[]> | undefined;
+  let next: Promise<IteratorResult<TopicMessage[]>> | undefined;
   try {
-    // One read() call ends after `limit` messages; keep reading until aborted.
     while (!controller.signal.aborted) {
-      for await (const messages of reader.read({
-        limit: options.limit,
-        waitMs: options.waitMs,
-        signal: controller.signal,
-      })) {
-        if (!messages.length) continue;
-        const events: YdbChangeEvent[] = [];
-        const groups = new Map<
-          bigint,
-          {
-            partitionId: bigint;
-            partitionSessionId: bigint;
-            events: YdbChangeEvent[];
-            errors: YdbChangefeedDecodeError[];
-            messages: TopicMessage[];
-          }
-        >();
-        for (const message of messages) {
-          const session = message.partitionSession.deref();
-          if (
-            !session ||
-            session.isStopped ||
-            quarantined.has(session.partitionSessionId)
-          )
-            continue;
-          let group = groups.get(session.partitionSessionId);
-          if (!group) {
-            group = {
-              partitionId: session.partitionId,
-              partitionSessionId: session.partitionSessionId,
-              events: [],
-              errors: [],
-              messages: [],
-            };
-            groups.set(session.partitionSessionId, group);
-          }
-          try {
-            const event = decodeMessage(model, message);
-            events.push(event);
-            group.events.push(event);
-            group.messages.push(message);
-          } catch (error) {
-            quarantined.set(session.partitionSessionId, message.offset);
-            group.errors.push({
-              partitionId: session.partitionId,
-              partitionSessionId: session.partitionSessionId,
-              offset: message.offset,
-              error,
-              payload: message.payload,
-            });
-          }
+      const messages: TopicMessage[] = [];
+      for (const [id, buffered] of pending) {
+        const control = controls.get(id);
+        if (!control || control.stopped) clearPending(id);
+        else if (!control.paused) {
+          messages.push(...buffered);
+          clearPending(id);
         }
-        if (!groups.size) continue;
-        const partitions = [...groups.values()].map((group) => {
-          let committed: Promise<void> | undefined;
-          return {
+      }
+      if (!messages.length) {
+        if (pendingBytes >= pendingBudget) {
+          const abortWake = () => notify();
+          controller.signal.addEventListener('abort', abortWake, {
+            once: true,
+          });
+          try {
+            await wake.promise;
+          } finally {
+            controller.signal.removeEventListener('abort', abortWake);
+            wake = deferred();
+          }
+          continue;
+        }
+        source ??= reader
+          .read({
+            limit: options.limit,
+            waitMs: options.waitMs,
+            signal: controller.signal,
+          })
+          [Symbol.asyncIterator]();
+        next ??= source.next();
+        const result = await Promise.race([
+          next.then((value) => ({ value })),
+          wake.promise.then(() => undefined),
+        ]);
+        wake = deferred();
+        if (!result) continue;
+        next = undefined;
+        if (result.value.done) {
+          source = undefined;
+          continue;
+        }
+        messages.push(...result.value.value);
+      }
+      if (!messages.length) continue;
+      const events: YdbChangeEvent[] = [];
+      const groups = new Map<
+        bigint,
+        {
+          partitionId: bigint;
+          partitionSessionId: bigint;
+          events: YdbChangeEvent[];
+          errors: YdbChangefeedDecodeError[];
+          messages: TopicMessage[];
+        }
+      >();
+      for (const message of messages) {
+        const session = message.partitionSession.deref();
+        if (
+          !session ||
+          controlFor(session).stopped ||
+          quarantined.has(session.partitionSessionId)
+        )
+          continue;
+        if (controlFor(session).paused) {
+          let buffered = pending.get(session.partitionSessionId);
+          if (!buffered)
+            pending.set(session.partitionSessionId, (buffered = []));
+          buffered.push(message);
+          pendingBytes += BigInt(message.payload.byteLength);
+          continue;
+        }
+        let group = groups.get(session.partitionSessionId);
+        if (!group) {
+          group = {
+            partitionId: session.partitionId,
+            partitionSessionId: session.partitionSessionId,
+            events: [],
+            errors: [],
+            messages: [],
+          };
+          groups.set(session.partitionSessionId, group);
+        }
+        try {
+          const event = decodeMessage(decoder, message);
+          events.push(event);
+          group.events.push(event);
+          group.messages.push(message);
+        } catch (error) {
+          quarantined.set(session.partitionSessionId, message.offset);
+          group.errors.push({
+            partitionId: session.partitionId,
+            partitionSessionId: session.partitionSessionId,
+            offset: message.offset,
+            error,
+            payload: message.payload,
+          });
+        }
+      }
+      if (!groups.size) continue;
+      const partitions = [...groups.values()].map((group) => {
+        const session = group.messages[0]?.partitionSession.deref();
+        const control = controls.get(group.partitionSessionId)!;
+        let committed: Promise<void> | undefined;
+        let commitTail = Promise.resolve();
+        const commitMessages = (messages: TopicMessage[]) => {
+          const operation = commitTail.then(async () => {
+            if (!messages.length) return;
+            if (!session || session.isStopped)
+              throw new Error('Changefeed partition session stopped');
+            if (control.stopped)
+              throw new Error(
+                `Changefeed partition stopped: ${String(control.stopReason)}`,
+              );
+            const last = messages[messages.length - 1]!;
+            if (last.offset === undefined)
+              throw new Error('Cannot commit event without offset');
+            if (last.offset < session.nextCommitStartOffset) return;
+            try {
+              await reader.commit(last);
+            } catch (reason) {
+              throw reason instanceof Error
+                ? reason
+                : new Error(`YDB changefeed commit failed: ${String(reason)}`);
+            }
+          });
+          commitTail = operation.catch(() => {});
+          return operation;
+        };
+        const stoppedCommit = () =>
+          Promise.reject(
+            new Error(
+              `Changefeed partition stopped: ${String(control.stopReason)}`,
+            ),
+          );
+        const commitThrough = (event: YdbChangeEvent) => {
+          if (control.stopped) return stoppedCommit();
+          const index = group.events.indexOf(event);
+          if (index < 0)
+            return Promise.reject(
+              new TypeError('Event does not belong to this partition batch'),
+            );
+          return commitMessages(group.messages.slice(0, index + 1));
+        };
+        return Object.assign(
+          Object.create(control) as YdbChangefeedPartitionControl,
+          {
             partitionId: group.partitionId,
             partitionSessionId: group.partitionSessionId,
             events: group.events,
             errors: group.errors,
+            commitThrough,
+            skip: commitThrough,
             commit: () =>
-              (committed ??= (async () => {
-                const badOffset = quarantined.get(group.partitionSessionId);
-                const safe = quarantined.has(group.partitionSessionId)
-                  ? group.messages.filter(
-                      (message) =>
-                        badOffset !== undefined &&
-                        message.offset !== undefined &&
-                        message.offset < badOffset,
-                    )
-                  : group.messages;
-                if (!safe.length) return;
-                try {
-                  await reader.commit(safe);
-                } catch (reason) {
-                  throw reason instanceof Error
-                    ? reason
-                    : new Error(
-                        `YDB changefeed commit failed: ${String(reason)}`,
-                      );
-                }
-              })()),
-          };
-        });
-        yield {
-          events,
-          partitions,
-          commit: async () => {
-            // Commit separately: the SDK's multi-partition promise resolves
-            // after the first partition acknowledgement, rather than all of them.
-            await Promise.all(
-              partitions
-                .filter((part) => !part.errors.length)
-                .map((part) => part.commit()),
-            );
+              control.stopped
+                ? stoppedCommit()
+                : (committed ??= (() => {
+                    const badOffset = quarantined.get(group.partitionSessionId);
+                    const safe = quarantined.has(group.partitionSessionId)
+                      ? group.messages.filter(
+                          (message) =>
+                            badOffset !== undefined &&
+                            message.offset !== undefined &&
+                            message.offset < badOffset,
+                        )
+                      : group.messages;
+                    return commitMessages(safe);
+                  })()),
           },
-        };
-      }
+        );
+      });
+      yield {
+        events,
+        partitions,
+        commit: async () => {
+          // Commit separately: the SDK's multi-partition promise resolves
+          // after the first partition acknowledgement, rather than all of them.
+          await Promise.all(
+            partitions
+              .filter((part) => !part.stopped && !part.errors.length)
+              .map((part) => part.commit()),
+          );
+        },
+      };
     }
     if (hookFailure) throw hookFailure.error;
   } finally {
+    controller.abort();
     for (const signal of [options.signal, shutdown])
       signal?.removeEventListener('abort', abort);
+    for (const control of controls.values()) control.stop();
+    controls.clear();
+    pending.clear();
+    // Release SDK generator abort listeners, including when the consumer breaks.
+    await source?.return?.().catch(() => {});
     // Never let reader teardown mask the error that ended the iteration.
     await reader.close().catch(() => reader.destroy());
   }

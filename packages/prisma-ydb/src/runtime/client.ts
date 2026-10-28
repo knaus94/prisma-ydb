@@ -73,8 +73,19 @@ import {
   type YdbChangeBatch,
   type YdbChangefeedOptions,
 } from './changefeed.js';
-import { YdbJsonElement } from './codecs.js';
+import {
+  YdbJsonElement,
+  type YdbTypeDescriptor,
+  type YdbTypeInput,
+  type YdbTypeOutput,
+} from './codecs.js';
 import { topicClient } from './topic.js';
+import { ydbReadMiddleware } from './operations.js';
+import {
+  scanModelIndex,
+  type YdbIndexScanOptions,
+  type YdbIndexScanResult,
+} from './keys.js';
 import {
   yqlModel,
   type YdbModelName,
@@ -119,6 +130,21 @@ export interface YdbQueryMembers<
   readonly sql: Db<C>;
   readonly raw: RawLane<C>;
   readonly enums: YdbEnums<C>;
+  /** Bounded index-keyset read, with residual filtering after the scan budget. */
+  scanIndex<
+    Name extends YdbModelName<C>,
+    const Field extends keyof YdbYqlOutput<C, Name> & string =
+      keyof YdbYqlOutput<C, Name> & string,
+  >(
+    model: Name,
+    options: YdbIndexScanOptions<
+      YdbYqlInput<C, Name>,
+      YdbYqlOutput<C, Name>,
+      Field
+    >,
+  ): Promise<
+    YdbIndexScanResult<Pick<YdbYqlOutput<C, Name>, Field>, YdbYqlInput<C, Name>>
+  >;
   /** Native YQL; Timestamp columns remain bigint microseconds so no precision is lost. */
   yql(
     text: string,
@@ -159,12 +185,29 @@ interface YdbClientLifecycle<C extends Contract<SqlStorage>> {
       string = keyof YdbYqlInput<C, Name> &
       keyof YdbYqlOutput<C, Name> &
       string,
+    const Micros extends Field = never,
+    const Extra extends Readonly<Record<string, YdbTypeDescriptor>> = Record<
+      never,
+      never
+    >,
   >(
     name: Name,
-    options?: { readonly fields?: readonly Field[] },
+    options?: {
+      readonly fields?: readonly Field[];
+      readonly micros?: readonly Micros[];
+      readonly extra?: Extra;
+    },
   ): YdbYqlModel<
-    Pick<YdbYqlInput<C, Name>, Field>,
-    Pick<YdbYqlOutput<C, Name>, Field>
+    Pick<YdbYqlInput<C, Name>, Field> & {
+      [Key in keyof Extra]: YdbTypeInput<Extra[Key]>;
+    },
+    {
+      [Key in Field]: Key extends Micros
+        ? null extends YdbYqlOutput<C, Name>[Key]
+          ? bigint | null
+          : bigint
+        : YdbYqlOutput<C, Name>[Key];
+    } & { [Key in keyof Extra]: YdbTypeOutput<Extra[Key]> }
   >;
   /** Topic API sharing this client's connected SDK driver; connect first. */
   topic(): ReturnType<typeof topicClient>;
@@ -392,7 +435,7 @@ export function ydb<C extends Contract<SqlStorage>>(
       adapter,
       driver: boundDriver,
       verifyMarker,
-      middleware: options.middleware,
+      middleware: [...(options.middleware ?? []), ydbReadMiddleware],
       closeRefusal: 'at-once',
     });
   const runtime = makeRuntime(driver);
@@ -517,6 +560,10 @@ export function ydb<C extends Contract<SqlStorage>>(
         return (enums ??= createEnums());
       },
       queryYql,
+      scanIndex(name, scanOptions) {
+        checkActive();
+        return scanModelIndex({ queryYql }, contract, name, scanOptions);
+      },
       async yql(text, parameters) {
         const result = await queryYql({ text, parameters });
         return result.resultSets.flatMap((set) => set.rows);

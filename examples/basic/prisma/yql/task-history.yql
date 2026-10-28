@@ -1,0 +1,5 @@
+DECLARE $projectId AS Utf8;
+SELECT id, title, done, updatedAt FROM `Task`
+WHERE projectId = $projectId ORDER BY id LIMIT 50;
+SELECT COUNT(*) AS total, MAX(updatedAt) AS lastUpdatedAt FROM `Task`
+WHERE projectId = $projectId;

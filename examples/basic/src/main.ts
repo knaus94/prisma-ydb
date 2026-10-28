@@ -5,6 +5,7 @@ import { ydbBindingFromEnv } from 'prisma-ydb/environment';
 import type { Contract } from './generated/contract.d.js';
 import contractJson from './generated/contract.json' with { type: 'json' };
 import { createSelections } from './selections.js';
+import { taskHistory } from './generated/yql.js';
 import type { FullTaskDto } from './dto.js';
 
 const db = ydb<Contract>({ contractJson, binding: ydbBindingFromEnv() });
@@ -65,6 +66,7 @@ try {
       .all(),
   );
   console.log('Known task status:', Status.has(task?.status));
+  console.log('Typed task history:', await taskHistory(db, { projectId }));
   console.log(
     'Included task dates:',
     await db.orm.Project.where({ id: projectId })
