@@ -1,6 +1,10 @@
-import { YdbQueryError } from './errors.js';
+import { classifyYdbError, YdbQueryError } from './errors.js';
 import type { Options } from './options.js';
-import type { YdbDriverEvent, YdbPoolStats } from './types.js';
+import type {
+  YdbDriverEvent,
+  YdbPoolStats,
+  YdbTransactionEventDetails,
+} from './types.js';
 
 /** Timing/status observer hook; it never sees SQL, parameters or issue text. */
 export interface EventSink {
@@ -14,6 +18,7 @@ export function emit(
   started: number,
   error?: unknown,
   attempt?: number,
+  transaction?: YdbTransactionEventDetails,
 ): void {
   const observer = sink.config.onEvent;
   if (!observer) return;
@@ -23,8 +28,14 @@ export function emit(
       pool: sink.stats,
       durationMs: performance.now() - started,
       success: error === undefined,
-      status: error instanceof YdbQueryError ? error.status : undefined,
+      status:
+        operation === 'transaction'
+          ? classifyYdbError(error).status
+          : error instanceof YdbQueryError
+            ? error.status
+            : undefined,
       ...(attempt !== undefined ? { attempt } : {}),
+      ...(transaction ? { transaction } : {}),
     });
   } catch {
     /* Observability must never change database execution semantics. */

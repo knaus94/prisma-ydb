@@ -55,6 +55,32 @@ export function retryDelayMs(
   );
 }
 
+export interface YdbTransactionRetryPolicy {
+  isRetryable(error: unknown): boolean;
+  /** Failed attempt number, starting at one. */
+  delayMs(error: unknown, attempt: number): number;
+}
+
+/** Policy for replaying a whole transaction, never an uncertain commit. */
+export function ydbTransactionRetryPolicy(options?: {
+  readonly uniqueViolation?: boolean;
+  readonly retry?: YdbRetryOptions;
+}): YdbTransactionRetryPolicy {
+  const retry = { ...retryDefaults, ...options?.retry };
+  const uniqueViolation = options?.uniqueViolation ?? true;
+  return {
+    isRetryable(error) {
+      const classification = classifyYdbError(error);
+      return (
+        !classification.outcomeUnknown &&
+        (classification.retryable ||
+          (uniqueViolation && classification.uniqueViolation))
+      );
+    },
+    delayMs: (error, attempt) => retryDelayMs(error, attempt, retry),
+  };
+}
+
 export interface WithRetryOptions extends YdbRetryOptions {
   readonly budgetMs: number;
   readonly signal?: AbortSignal;

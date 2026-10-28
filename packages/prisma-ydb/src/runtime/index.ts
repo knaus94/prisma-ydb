@@ -122,6 +122,8 @@ export {
   classifyYdbError,
   type YdbErrorClassification,
   withRetry,
+  ydbTransactionRetryPolicy,
+  type YdbTransactionRetryPolicy,
   type WithRetryOptions,
 } from '../driver/index.js';
 

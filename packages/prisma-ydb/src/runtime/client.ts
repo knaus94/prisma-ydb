@@ -48,11 +48,16 @@ import {
   preparedStatementQuery,
 } from '@prisma/orm-family-sql/runtime/internal/prepared-query';
 import { sleep } from '../driver/abort.js';
+import { emit } from '../driver/events.js';
+import type { TransactionObservation } from '../driver/connection.js';
+import { transactionControl, transactionObservation } from './transaction.js';
 import {
   YdbDriver,
-  isRetryableYdbError,
-  retryDefaults,
-  retryDelayMs,
+  classifyYdbError,
+  ydbTransactionRetryPolicy,
+  type YdbTransactionRetryPolicy,
+  type YdbErrorClassification,
+  type YdbTransactionEventDetails,
   type YdbPoolStats,
   type YdbHealth,
   type YdbBinding,
@@ -162,7 +167,21 @@ export interface YdbTransactionContext<
   commitWith<T>(callback: () => T | PromiseLike<T>): Promise<T>;
 }
 export interface YdbTransactionOptions {
-  readonly retry?: boolean | { readonly maxAttempts?: number };
+  readonly retry?:
+    | boolean
+    | {
+        readonly maxAttempts?: number;
+        readonly budgetMs?: number;
+        readonly policy?: YdbTransactionRetryPolicy;
+      };
+  readonly signal?: AbortSignal;
+  readonly onRetry?: (event: {
+    error: unknown;
+    attempt: number;
+    delayMs: number;
+    classification: YdbErrorClassification;
+  }) => void;
+  readonly stats?: 'none' | 'basic';
   /**
    * `snapshotReadOnly` reads one consistent snapshot without conflicting with
    * writers; the server rejects writes inside it. Default: `serializable`.
@@ -368,6 +387,10 @@ export function ydb<C extends Contract<SqlStorage>>(
     driver: ydbRuntimeDriver,
   });
   const nativeDriver = new YdbDriver(options.driverOptions);
+  const defaultTransactionPolicy = ydbTransactionRetryPolicy({
+    uniqueViolation: false,
+    retry: nativeDriver.config.retry || undefined,
+  });
   let binding =
     options.binding ?? (options.url ? { url: options.url } : undefined);
   let connection: Promise<void> | undefined;
@@ -718,43 +741,156 @@ export function ydb<C extends Contract<SqlStorage>>(
     callback: (tx: YdbTransactionContext<C>) => PromiseLike<T>,
     transactionOptions?: YdbTransactionOptions,
   ): Promise<T> {
-    const retry = transactionOptions?.retry;
-    const maxAttempts =
-      retry === true ? 5 : retry ? (retry.maxAttempts ?? 5) : 1;
-    if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1)
-      throw new TypeError('Transaction maxAttempts must be a positive integer');
-    const mode = transactionOptions?.mode ?? 'serializable';
-    if (mode !== 'serializable' && mode !== 'snapshotReadOnly')
-      throw new TypeError(
-        'Transaction mode must be serializable or snapshotReadOnly',
+    if (
+      !transactionOptions &&
+      !nativeDriver.config.onEvent &&
+      nativeDriver.config.statsMode !== 'basic'
+    )
+      return await runTransaction<T>(
+        callback,
+        { committed: false },
+        'serializable',
       );
-    for (let attempt = 1; ; attempt++) {
-      const state = { committed: false };
-      try {
-        return await runTransaction<T>(callback, state, mode);
-      } catch (error) {
-        const primary = primaryTransactionFailure(error);
-        if (
-          state.committed ||
-          attempt >= maxAttempts ||
-          !isRetryableYdbError(primary, false)
-        )
-          throw error;
-        const delay = retryDelayMs(
-          primary,
-          attempt,
-          nativeDriver.config.retry || retryDefaults,
+    const observed = !!nativeDriver.config.onEvent;
+    const started = observed ? performance.now() : 0;
+    const failures:
+      | {
+          attempt: number;
+          kind: YdbErrorClassification['kind'];
+          status?: number;
+        }[]
+      | undefined = observed ? [] : undefined;
+    let attempts = 0;
+    let committed = false;
+    let finalObservation: ReturnType<typeof transactionObservation> | undefined;
+    let failure: unknown;
+    let failed = false;
+    let control: ReturnType<typeof transactionControl> | undefined;
+    const mode = transactionOptions?.mode ?? 'serializable';
+    try {
+      const retry = transactionOptions?.retry;
+      const maxAttempts =
+        retry === true ? 5 : retry ? (retry.maxAttempts ?? 5) : 1;
+      if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1)
+        throw new TypeError(
+          'Transaction maxAttempts must be a positive integer',
         );
-        // The pause ends early when the client closes; nothing is replayed then.
-        if (delay)
-          try {
-            await sleep(delay, shutdown.signal);
-          } catch {
-            throw new SqlConnectionError(
-              'YDB client closed before the transaction could be retried',
-              { cause: error instanceof Error ? error : undefined },
-            );
+      const budgetMs = typeof retry === 'object' ? retry.budgetMs : undefined;
+      if (
+        budgetMs !== undefined &&
+        (!Number.isFinite(budgetMs) ||
+          budgetMs <= 0 ||
+          budgetMs > 2_147_483_647)
+      )
+        throw new TypeError(
+          'Transaction budgetMs must be positive and at most 2147483647',
+        );
+      if (mode !== 'serializable' && mode !== 'snapshotReadOnly')
+        throw new TypeError(
+          'Transaction mode must be serializable or snapshotReadOnly',
+        );
+      transactionOptions?.signal?.throwIfAborted();
+      if (budgetMs !== undefined || transactionOptions?.signal)
+        control = transactionControl(transactionOptions?.signal, budgetMs);
+      const policy =
+        (typeof retry === 'object' ? retry.policy : undefined) ??
+        defaultTransactionPolicy;
+      const stats =
+        transactionOptions?.stats === 'basic' ||
+        nativeDriver.config.statsMode === 'basic';
+      for (let attempt = 1; ; attempt++) {
+        control?.check();
+        attempts = attempt;
+        const state = { committed: false };
+        finalObservation = observed
+          ? transactionObservation(stats, control?.signal)
+          : undefined;
+        const observation =
+          finalObservation?.observation ??
+          (control || stats
+            ? {
+                signal: control?.signal,
+                stats: stats ? ('basic' as const) : undefined,
+              }
+            : undefined);
+        try {
+          return await runTransaction<T>(
+            callback,
+            state,
+            mode,
+            observation,
+            control,
+          );
+        } catch (error) {
+          const primary = primaryTransactionFailure(error);
+          const classification = classifyYdbError(primary);
+          failures?.push({
+            attempt,
+            kind: classification.kind,
+            status: classification.status,
+          });
+          control?.failed(primary);
+          if (classification.outcomeUnknown) throw error;
+          control?.check();
+          if (
+            state.committed ||
+            attempt >= maxAttempts ||
+            !policy.isRetryable(primary)
+          )
+            throw error;
+          const delayMs = policy.delayMs(primary, attempt);
+          if (control && performance.now() + delayMs >= control.deadline)
+            throw error;
+          transactionOptions?.onRetry?.({
+            error,
+            attempt: attempt + 1,
+            delayMs,
+            classification,
+          });
+          control?.check();
+          // The pause holds no session, and close() still interrupts it.
+          if (delayMs) {
+            const linked = control
+              ? linkSignals(control.signal, shutdown.signal)
+              : undefined;
+            try {
+              await sleep(delayMs, linked?.signal ?? shutdown.signal);
+            } catch {
+              control?.check();
+              throw new SqlConnectionError(
+                'YDB client closed before the transaction could be retried',
+                { cause: error instanceof Error ? error : undefined },
+              );
+            } finally {
+              linked?.dispose();
+            }
           }
+        } finally {
+          committed = state.committed;
+        }
+      }
+    } catch (error) {
+      failed = true;
+      failure = error;
+      throw error;
+    } finally {
+      control?.dispose();
+      if (failures) {
+        const details: YdbTransactionEventDetails = {
+          mode,
+          attempts,
+          committed,
+          failures,
+          ...(finalObservation?.details() ?? { statements: 0 }),
+        };
+        emit(
+          nativeDriver,
+          'transaction',
+          started,
+          failed ? (failure ?? new Error('Transaction failed')) : undefined,
+          attempts,
+          details,
+        );
       }
     }
   }
@@ -762,14 +898,23 @@ export function ydb<C extends Contract<SqlStorage>>(
     callback: (tx: YdbTransactionContext<C>) => PromiseLike<T>,
     state: { committed: boolean },
     mode: YdbTransactionMode,
+    observation?: TransactionObservation,
+    control?: ReturnType<typeof transactionControl>,
   ): Promise<T> {
     if (!codecRegistryValidated) {
       validateCodecRegistryCompleteness(context.codecDescriptors, contract);
       codecRegistryValidated = true;
     }
-    await ensureConnected();
-    await warmMarker();
-    const acquired = await nativeDriver.acquireConnection();
+    if (control) {
+      control.check();
+      await control.wait(ensureConnected());
+      await control.wait(warmMarker());
+      control.check();
+    } else {
+      await ensureConnected();
+      await warmMarker();
+    }
+    const acquired = await nativeDriver.acquireConnection(control?.signal);
     let settled = false;
     let transaction:
       | Awaited<ReturnType<typeof acquired.beginTransaction>>
@@ -784,8 +929,19 @@ export function ydb<C extends Contract<SqlStorage>>(
     let callbackTimer: ReturnType<typeof setTimeout> | undefined;
     let commitScope: { statements: number; failure?: Error } | undefined;
     let mutationScopes = 0;
+    const cancel = control
+      ? () => {
+          settled = true;
+          controller.abort(control.signal.reason);
+        }
+      : undefined;
+    if (cancel) {
+      control!.signal.addEventListener('abort', cancel, { once: true });
+      if (control!.signal.aborted) cancel();
+    }
     try {
-      transaction = await acquired.beginTransaction({ mode });
+      if (control) controller.signal.throwIfAborted();
+      transaction = await acquired.beginTransaction({ mode }, observation);
       const checkActive = () => {
         if (settled || transaction?.committed) {
           const error = new Error(
@@ -889,6 +1045,9 @@ export function ydb<C extends Contract<SqlStorage>>(
               signal: linked.signal,
               commit,
             });
+          } catch (error) {
+            lastScopedFailure = error;
+            throw error;
           } finally {
             linked.dispose();
           }
@@ -952,7 +1111,8 @@ export function ydb<C extends Contract<SqlStorage>>(
         }, nativeDriver.config.transactionTimeoutMs);
         callbackTimer.unref();
       });
-      result = await Promise.race([callbackResult, deadline]);
+      const work = Promise.race([callbackResult, deadline]);
+      result = control ? await control.wait(work) : await work;
       clearTimeout(callbackTimer);
       if (mutationFailure) throw mutationFailure;
       await scopedRuntime.close();
@@ -963,7 +1123,12 @@ export function ydb<C extends Contract<SqlStorage>>(
     } catch (error) {
       failed = true;
       clearTimeout(callbackTimer);
-      failure = controller.signal.aborted ? controller.signal.reason : error;
+      control?.failed(error);
+      failure = classifyYdbError(error).outcomeUnknown
+        ? error
+        : controller.signal.aborted
+          ? controller.signal.reason
+          : error;
       settled = true;
       controller.abort(error);
       try {
@@ -988,6 +1153,15 @@ export function ydb<C extends Contract<SqlStorage>>(
           );
         }
       }
+      // Rollback waits for the connection lock, so direct statement failures are
+      // available here even when cancellation won the callback race.
+      if (control?.signal.aborted && lastScopedFailure !== undefined)
+        control.failed(lastScopedFailure);
+      if (
+        control?.signal.aborted &&
+        classifyYdbError(lastScopedFailure).outcomeUnknown
+      )
+        failure = lastScopedFailure;
     }
     try {
       // A definite begin/commit failure leaves a clean session; keep it pooled.
@@ -1004,6 +1178,7 @@ export function ydb<C extends Contract<SqlStorage>>(
         : cleanupError;
       failed = true;
     }
+    if (cancel) control!.signal.removeEventListener('abort', cancel);
     if (failed) throw failure;
     return result as T;
   }

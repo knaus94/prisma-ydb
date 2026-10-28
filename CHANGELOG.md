@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add `ydbTransactionRetryPolicy` with configurable unique-violation retry and backoff.
+- Add transaction-wide `retry.budgetMs`, caller `signal` and `onRetry`; preserve uncertain commit outcomes during cancellation.
+- Emit one `transaction` driver event per callback call, with attempt/failure details and optional final-attempt BASIC execution statistics.
+
 ## 0.1.0-rc.7
 
 - Fix `whereKeys` typing: it returns Prisma's `fns` condition type, so `where((m) => whereKeys(m, keys))` and `and(m.flag.eq(true), whereKeys(m, keys))` compile, and it accepts model accessors with relations. Key objects are typed by the model's scalar field inputs. The generated YQL is unchanged.

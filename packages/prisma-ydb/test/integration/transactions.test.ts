@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ydb } from 'prisma-ydb/runtime';
+import { ydb, ydbTransactionRetryPolicy } from 'prisma-ydb/runtime';
+import type { YdbDriverEvent } from 'prisma-ydb/driver';
 import { ydbBindingFromEnv } from 'prisma-ydb/environment';
 import { Text, Int32 } from '@ydbjs/value/primitive';
 import { createFixture, quote, requireEndpoint } from './helpers.ts';
@@ -15,6 +16,7 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
     `CREATE TABLE ${quote(physical)} (id Utf8 NOT NULL, balance Int32 NOT NULL, PRIMARY KEY (id));`,
   );
   const events: string[] = [];
+  const transactionEvents: YdbDriverEvent[] = [];
   const db = ydb({
     contractJson: fixture.contractJson,
     binding: ydbBindingFromEnv(requireEndpoint()),
@@ -25,8 +27,10 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
       queryTimeoutMs: 10_000,
       acquireTimeoutMs: 5_000,
       closeTimeoutMs: 5_000,
-      onEvent: (event) =>
-        events.push(event.operation + (event.success ? '' : '!')),
+      onEvent: (event) => {
+        if (event.operation === 'transaction') transactionEvents.push(event);
+        else events.push(event.operation + (event.success ? '' : '!'));
+      },
     },
   });
   context.after(() => db.close());
@@ -203,6 +207,101 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
       assert.equal(db.stats().held, 0);
       assert.equal(db.stats().paths.held.active, 0);
       assert.ok(db.stats().paths.held.errors >= 1);
+    },
+  );
+  await context.test(
+    'a real conflict replays the callback and emits final-attempt stats',
+    async () => {
+      transactionEvents.length = 0;
+      let attempts = 0;
+      const retries: number[] = [];
+      await db.transaction(
+        async (tx) => {
+          attempts++;
+          await tx.orm.Account.where({ id: 'a' }).first();
+          if (attempts === 1)
+            await db.orm.Account.where({ id: 'a' }).updateAll({ balance: 100 });
+          await tx.commitWith(() =>
+            tx.orm.Account.where({ id: 'a' }).updateAll({ balance: 101 }),
+          );
+        },
+        {
+          retry: { policy: ydbTransactionRetryPolicy() },
+          stats: 'basic',
+          onRetry: (event) => retries.push(event.attempt),
+        },
+      );
+      assert.equal(attempts, 2);
+      assert.deepEqual(retries, [2]);
+      assert.equal(transactionEvents.length, 1);
+      const event = transactionEvents[0]!;
+      assert.equal(event.success, true);
+      assert.equal(event.attempt, 2);
+      assert.ok(event.durationMs >= 0);
+      assert.equal(event.transaction?.committed, true);
+      assert.equal(event.transaction?.mode, 'serializable');
+      assert.equal(event.transaction?.attempts, 2);
+      assert.equal(event.transaction?.failures.length, 1);
+      assert.equal(event.transaction?.failures[0]?.kind, 'conflict');
+      assert.equal(event.transaction?.statements, 2);
+      const stats = event.transaction?.stats;
+      assert.ok(stats);
+      assert.ok(stats.phases > 0);
+      assert.ok(stats.affectedShards > 0);
+      assert.ok(stats.maxAffectedShards > 0);
+      assert.ok(stats.affectedShards >= stats.maxAffectedShards);
+      assert.equal(typeof stats.cpuTimeUs, 'bigint');
+      assert.equal(typeof stats.durationUs, 'bigint');
+      const table = stats.tables.find((entry) => entry.name.endsWith(physical));
+      assert.ok(table);
+      assert.ok(table.partitionsCount > 0);
+      assert.ok(table.readRows > 0n);
+      assert.ok(table.updateRows > 0n);
+    },
+  );
+
+  await context.test(
+    'signal and overall budget cancel long attempts and roll back writes',
+    async () => {
+      for (const kind of ['signal', 'budget'] as const) {
+        const controller = new AbortController();
+        const reason = new Error('caller cancelled');
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let attemptSignal: AbortSignal | undefined;
+        transactionEvents.length = 0;
+        try {
+          await assert.rejects(
+            db.transaction(
+              async (tx) => {
+                attemptSignal = tx.signal;
+                await tx.orm.Account.create({ id: kind, balance: 999 });
+                if (kind === 'signal')
+                  timer = setTimeout(() => controller.abort(reason), 10);
+                await new Promise<void>((resolve) => {
+                  if (tx.signal.aborted) resolve();
+                  else
+                    tx.signal.addEventListener('abort', () => resolve(), {
+                      once: true,
+                    });
+                });
+              },
+              kind === 'signal'
+                ? { signal: controller.signal }
+                : { retry: { budgetMs: 1000 } },
+            ),
+            kind === 'signal'
+              ? (error) => error === reason
+              : { name: 'TimeoutError' },
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(attemptSignal?.aborted, true);
+        assert.equal(transactionEvents.length, 1);
+        assert.equal(transactionEvents[0]?.success, false);
+        assert.equal(transactionEvents[0]?.transaction?.committed, false);
+        assert.equal(await db.orm.Account.where({ id: kind }).first(), null);
+      }
     },
   );
 });

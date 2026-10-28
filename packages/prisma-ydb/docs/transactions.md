@@ -114,6 +114,38 @@ limit comes from `transaction(..., { retry })`, separately from driver
 `maxAttempts`. If driver retries are disabled, explicitly enabled callback
 retries use the default delays.
 
+For an explicit policy, import `ydbTransactionRetryPolicy` from
+`prisma-ydb/runtime` or `prisma-ydb/driver`:
+
+```ts
+await db.transaction(updateAccount, {
+  retry: {
+    maxAttempts: 5,
+    budgetMs: 5000,
+    policy: ydbTransactionRetryPolicy({
+      uniqueViolation: true,
+      retry: { baseDelayMs: 20, maxDelayMs: 1000 },
+    }),
+  },
+  signal: request.signal,
+  onRetry: ({ attempt, delayMs, classification }) =>
+    log({ attempt, delayMs, kind: classification.kind }),
+});
+```
+
+The factory retries unique violations by default; set `uniqueViolation: false`
+to disable this. Without an explicit policy, transactions keep the existing
+behavior and do not retry unique violations. The factory follows error causes
+and the primary transaction aggregate failure. It never retries uncertain commit
+outcomes, authored Ensure failures, referential failures, cancellations or
+unknown application errors. Custom policies provide `isRetryable(error)` and
+`delayMs(error, failedAttempt)`, where failed attempts start at one. An
+acknowledged commit or an unknown outcome prevents replay even with a custom policy.
+
+`onRetry` runs before backoff with the **next** attempt number (starting at 2),
+the error, delay and classification. A thrown hook exception stops replay and
+becomes the call's error, matching `withRetry`.
+
 The backoff pause between callback attempts holds no session. `db.close()`
 interrupts it: the pending transaction rejects with a connection error instead
 of attempting another replay.
@@ -213,9 +245,41 @@ an arbitrary callback that ignores the signal: it may keep executing after the
 timeout, but further queries through the settled transaction are rejected.
 Individual `queryYql` requests accept `signal` and `timeoutMs`.
 
-The transaction budget applies per attempt. Account for multiple attempts and
-backoff when setting a request-level deadline. `db.transaction` currently has
-no caller-supplied `signal` option.
+`transactionTimeoutMs` applies separately to each attempt. For one deadline
+covering connection/session acquisition, all attempts and backoff, pass
+`retry: { budgetMs: 5000 }` (five attempts by default). The budget must be finite,
+positive and at most 2,147,483,647 milliseconds. Expiry aborts `tx.signal`,
+cancels in-flight YQL, rolls back and rejects with a `TimeoutError` DOMException;
+when an attempt has failed, that failure is its `cause`. If the next backoff
+cannot fit within the remaining budget, the last failure is returned immediately.
+
+Pass `signal` on the transaction options for caller cancellation. An already
+aborted signal rejects before session acquisition. Cancellation during acquisition,
+an attempt or backoff rejects with `signal.reason`, after cancelling the attempt
+and rolling back. If cancellation occurs during commit and its outcome is unknown,
+the commit failure is returned instead, preserving `outcomeUnknown`.
+
+## Transaction events and statistics
+
+When `driverOptions.onEvent` is configured, each `db.transaction` call emits one
+`operation: 'transaction'` event after cleanup, on success or failure. Existing
+statement and connection events are unchanged. Its top-level `attempt` equals
+the total attempts; `durationMs`, `success` and `status` describe the whole call.
+The `transaction` details include `mode`, `attempts`, `committed`, each failed
+attempt's `kind` and optional `status`, and the final attempt's statement count.
+
+Set transaction `stats: 'basic'` or driver `statsMode: 'basic'` to request BASIC
+execution statistics for every statement. The transaction event aggregates only
+the final attempt's statistics: phase count, summed `affectedShards`, maximum
+per-phase `maxAffectedShards`, and `cpuTimeUs` / `durationUs` as `bigint`.
+Per-table entries contain the name, maximum observed `partitionsCount` and
+`bigint` totals for `readRows`, `readBytes`, `updateRows` and `deleteRows`.
+Statistics are absent unless requested; aggregation runs only with an event sink.
+
+A separate CommitTransaction RPC has no execution statistics. A statement
+committed with `commitWith` or `commit: true` includes its commit in the statement
+statistics. YDB reports shard counts per phase, without shard IDs, so summed
+counts cannot give an exact number of distinct shards across a transaction.
 
 ## Transaction boundaries
 

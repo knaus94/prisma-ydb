@@ -180,11 +180,19 @@ async function collect(
   };
 }
 
+/** @internal Opt-in observation shared with the runtime transaction wrapper. */
+export interface TransactionObservation {
+  readonly signal?: AbortSignal;
+  readonly stats?: 'basic';
+  readonly onStatement?: (stats?: QueryStats) => void;
+}
+
 /** @internal Transaction state owned by a connection; YdbTransaction is its public handle. */
 export interface ActiveTransaction {
   /** Server transaction id; assigned by the first statement's response. */
   id: string | undefined;
   readonly mode: YdbTransactionMode;
+  readonly observation?: TransactionObservation;
   readonly deadline: Scope;
   failed: boolean;
   /** Set when a statement carried `commit: true` and succeeded. */
@@ -299,11 +307,14 @@ export class YdbConnection implements SqlConnection {
     // 'streaming' means the server has not sent a terminal status yet.
     let phase: 'pending' | 'streaming' | 'terminal' = 'pending';
     let failure: unknown;
+    let observation: TransactionObservation | undefined;
+    let execStats: QueryStats | undefined;
     try {
       release = await this.#lock(scope.signal);
       this.#busy++;
       this.#assertOpen();
       const transaction = this.#activeTransaction(expected);
+      observation = transaction?.observation;
       const commit = request.commit === true;
       if (commit && !transaction)
         throw new SqlQueryError(
@@ -323,7 +334,8 @@ export class YdbConnection implements SqlConnection {
           },
           parameters,
           statsMode:
-            (request.stats ?? this.#config.statsMode) === 'basic'
+            (observation?.stats ?? request.stats ?? this.#config.statsMode) ===
+            'basic'
               ? StatsMode.BASIC
               : StatsMode.NONE,
           ...txControl(mode, transaction, commit),
@@ -338,6 +350,8 @@ export class YdbConnection implements SqlConnection {
           phase = 'terminal';
           checkStatus(part);
         }
+        if (observation?.onStatement && part.execStats)
+          execStats = part.execStats;
         yield decodePart(part, wire, plans);
       }
       phase = 'terminal';
@@ -369,6 +383,7 @@ export class YdbConnection implements SqlConnection {
         release();
       }
       scope.dispose();
+      observation?.onStatement?.(execStats);
       emit(
         this.#sink,
         'query',
@@ -428,6 +443,7 @@ export class YdbConnection implements SqlConnection {
   /** Local only: the server transaction starts with the first statement. */
   beginTransaction(
     options: YdbBeginTransactionOptions = {},
+    observation?: TransactionObservation,
   ): Promise<YdbTransaction> {
     return this.#operation('begin', async () => {
       this.#assertOpen();
@@ -439,7 +455,11 @@ export class YdbConnection implements SqlConnection {
       const transaction: ActiveTransaction = {
         id: undefined,
         mode,
-        deadline: deadline(this.#config.transactionTimeoutMs),
+        deadline: deadline(
+          this.#config.transactionTimeoutMs,
+          observation?.signal,
+        ),
+        observation,
         failed: false,
         committed: false,
       };

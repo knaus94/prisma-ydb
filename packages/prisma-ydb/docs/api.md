@@ -205,6 +205,11 @@ Both helpers are exported from runtime and driver entry points. See
 [error classification and autocommit retries](transactions.md#error-classification-and-autocommit-retry-helper)
 for the complete behavior and an example.
 
+Each `db.transaction` call also emits one `operation: 'transaction'` event,
+including attempts, failures, committed state and the final attempt's statement
+count. Transaction `stats: 'basic'` or driver `statsMode: 'basic'` adds aggregated
+execution statistics. See [transaction events](transactions.md#transaction-events-and-statistics).
+
 Every `onEvent` includes a `pool` snapshot after the operation. Native session
 creation, including warmup, reports `operation: 'session-create'`, duration and
 success/failure. Retries report `operation: 'retry'`, the next `attempt`, and
@@ -245,6 +250,13 @@ primary failure can retry the whole callback. Transaction timeouts, user errors,
 transport errors and `outcomeUnknown` failures are not retried by this option.
 A callback is never retried after commit succeeds, including if later cleanup
 fails. An `outcomeUnknown` error requires reconciliation before retrying a mutation.
+
+Transaction options also accept caller `signal`, `onRetry`, `stats`, and
+`retry: { maxAttempts, budgetMs, policy }`. The whole-call budget covers acquisition,
+attempts and backoff; `transactionTimeoutMs` remains per attempt.
+`ydbTransactionRetryPolicy()`, exported from runtime and driver, retries unique
+violations by default; the implicit transaction policy keeps unique retries off.
+See [callback retries and cancellation](transactions.md#callback-retries).
 
 Interactive transactions use Serializable read-write mode. Nested transactions,
 savepoints, row-locking clauses and other isolation levels are unsupported.

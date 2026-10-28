@@ -11,6 +11,8 @@ export {
   retryDefaults,
   retryDelayMs,
   withRetry,
+  ydbTransactionRetryPolicy,
+  type YdbTransactionRetryPolicy,
   type WithRetryOptions,
 } from './retry.js';
 export { UuidValue } from './uuid.js';
@@ -28,6 +30,7 @@ export type {
   YdbPathStats,
   YdbDriverOptions,
   YdbDriverEvent,
+  YdbTransactionEventDetails,
   YdbParameter,
   YdbQueryRequest,
   YdbQueryPart,

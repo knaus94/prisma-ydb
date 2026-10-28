@@ -1,6 +1,7 @@
 import type { SqlExecuteRequest } from '@prisma/orm-family-sql/relational-core/ast';
 import type { QueryStats } from '@ydbjs/api/query';
 import type { Column, Type, Value as WireValue } from '@ydbjs/api/value';
+import type { YdbErrorClassification } from './errors.js';
 import type { DriverOptions } from '@ydbjs/core';
 import type { Value } from '@ydbjs/value';
 
@@ -37,6 +38,33 @@ export interface YdbDriverOptions {
   readonly onEvent?: (event: YdbDriverEvent) => void;
 }
 
+export interface YdbTransactionEventDetails {
+  readonly mode: YdbTransactionMode;
+  readonly attempts: number;
+  readonly committed: boolean;
+  readonly failures: readonly {
+    attempt: number;
+    kind: YdbErrorClassification['kind'];
+    status?: number;
+  }[];
+  readonly statements: number;
+  readonly stats?: {
+    readonly phases: number;
+    readonly affectedShards: number;
+    readonly maxAffectedShards: number;
+    readonly cpuTimeUs: bigint;
+    readonly durationUs: bigint;
+    readonly tables: readonly {
+      name: string;
+      partitionsCount: number;
+      readRows: bigint;
+      readBytes: bigint;
+      updateRows: bigint;
+      deleteRows: bigint;
+    }[];
+  };
+}
+
 export interface YdbDriverEvent {
   readonly operation:
     | 'connect'
@@ -48,7 +76,9 @@ export interface YdbDriverEvent {
     | 'rollback'
     | 'destroy'
     | 'retry'
-    | 'bulk-upsert';
+    | 'bulk-upsert'
+    | 'transaction';
+  readonly transaction?: YdbTransactionEventDetails;
   readonly pool: YdbPoolStats;
   readonly attempt?: number;
   readonly durationMs: number;
