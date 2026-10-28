@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0-rc.4
+
+- Interactive transactions begin on the server with their first statement instead of a BeginTransaction RPC; empty transactions and rollbacks that never reached the server are local. `queryYql({ commit: true })` inside a transaction commits together with that statement.
+- Decode result sets with per-column decoders built once per result set, and bound buffered results with a cheap per-row estimate.
+- Strip compiler metadata comments from statement text before sending it; the parsed-header cache holds 2048 statements.
+- Make the pause between whole-callback transaction retries end when the client closes.
+- Resolve Prisma's prepared-statement bridge through its named internal export and verify the pinned runtime shape when a client is created, instead of scanning prototype symbols and degrading silently.
+- Document that ORM calls compile on every invocation and that `db.prepare` is the hot-path alternative.
+- Add `db.transaction(cb, { mode: 'snapshotReadOnly' })` for consistent multi-statement reads that never conflict with writers.
+- Add `maxTransactionSessions`, a cap on sessions held across statements, and the `held` pool statistic.
+- Read relation includes through `VIEW index WHERE fk IN $keys` when the child's foreign key is indexed or key-prefixed, turning child scans into lookups. Includes without such an index, grouped/distinct-on outer queries and `limit`/`offset` pages without `orderBy` keep the previous join.
+- Add `db.bulkUpsert(model, rows)` on TableService BulkUpsert, `db.streaming` lanes without buffered result bounds, and `db.changefeed(model, { consumer })` decoding managed Json changefeeds. New dependency: `@ydbjs/topic` 6.1.4.
+- Add `@@columnStore` for column-oriented tables: creation, introspection, verification and ORM mutations with emulated RETURNING. Row-only features (`@@index`, `@@unique`, `@@ttl`, `@@changefeed`, `@@partitioning`, `Uuid`, relation actions) are rejected at contract emission; changing a table's store kind is refused. Bulk uploads to column tables always carry full rows.
+- Column-table mutations never read the table after writing it: on YDB 26.2 a row read back after its own update in one transaction ignores later deletes. Avoid that pattern in raw YQL as well.
+- `tableExists` and `listYdbTables` accept column tables; standalone column stores are still rejected. Column-table duplicate keys map to Prisma's unique violation (`23505`).
+- Add an offline compiler test lane (`yarn test:unit`) and live integration coverage for the features above.
+
 ## 0.1.0-rc.3
 
 - Add a native `Uuid` scalar across ORM codecs, parameters, migrations and introspection, with validating `UuidValue` parameters while preserving the SDK `Uuid` export. Document server UUID ordering and keyset pagination.
