@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-rc.3
+
+- Add a native `Uuid` scalar across ORM codecs, parameters, migrations and introspection, with validating `UuidValue` parameters while preserving the SDK `Uuid` export. Document server UUID ordering and keyset pagination.
+- Bridge prepared queries to public YDB clients and active transaction contexts, retaining closed-client and settled-transaction checks.
+- Add first-class `@@partitioning` and `@@changefeed` schema attributes with migration planning, introspection, verification, drift diagnostics and persisted checkpoint recovery.
+- Preserve explicit false settings in hashed contract metadata with canonical `ENABLED`/`DISABLED` flags; keep booleans in schema authoring and schema IR.
+- Add the integration suite and a pinned local-YDB CI job covering UUIDs, prepared queries, managed partitioning/changefeeds, drift and interrupted migration recovery.
+
+- Tooling: leave workspace dependency updates to Yarn when bumping release versions, avoiding npm rejection of `workspace:*` dependencies.
+
 ## 0.1.0-rc.2
 
 - Add string enums: generated literal types, flat `db.enums.<Name>` accessors (namespaced access retained) and contract printing of enum definitions and defaults.

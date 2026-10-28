@@ -10,7 +10,14 @@ if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
 for (const [command, args] of [
   [
     'npm',
-    ['version', version, '--no-git-tag-version', '--workspace', 'prisma-ydb'],
+    [
+      'version',
+      version,
+      '--no-git-tag-version',
+      '--no-workspaces-update',
+      '--workspace',
+      'prisma-ydb',
+    ],
   ],
   [
     process.execPath,
