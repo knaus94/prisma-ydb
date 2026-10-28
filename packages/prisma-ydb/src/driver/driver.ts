@@ -1,16 +1,15 @@
-import {
-  SqlConnectionError,
-  SqlQueryError,
-} from '@prisma/orm-family-sql/errors';
+import { SqlConnectionError } from '@prisma/orm-family-sql/errors';
 import type {
   SqlDriver,
   SqlDriverState,
   SqlStatementStats,
 } from '@prisma/orm-family-sql/relational-core/ast';
+import { TableServiceDefinition } from '@ydbjs/api/table';
 import { Driver } from '@ydbjs/core';
-import { deadline, sleep } from './abort.js';
+import { deadline, sleep, type Scope } from './abort.js';
 import { YdbConnection } from './connection.js';
 import {
+  checkOperation,
   isRetryableYdbError,
   normalizeError,
   YdbQueryError,
@@ -23,6 +22,7 @@ import { Semaphore } from './semaphore.js';
 import { Session } from './session.js';
 import type {
   YdbBinding,
+  YdbBulkUpsertRequest,
   YdbDriverOptions,
   YdbHealth,
   YdbPoolStats,
@@ -32,12 +32,21 @@ import type {
   YdbRetryOptions,
   YdbSqlExecuteRequest,
 } from './types.js';
-import { isCompilerSelect, rowProjector, sqlRequest } from './values.js';
+import {
+  encodeParameters,
+  isCompilerSelect,
+  rowProjector,
+  sqlRequest,
+} from './values.js';
 
-type Attempt<T> = (
-  connection: YdbConnection,
-  request: YdbQueryRequest,
-) => AsyncIterable<T>;
+/** One driver-owned request: deadline shared by all attempts plus the retry decision. */
+interface Run {
+  readonly scope: Scope;
+  /** The request bounded to the remaining budget for the next attempt. */
+  bound(): YdbQueryRequest;
+  /** Resolves after the backoff pause when a retry is allowed; otherwise rethrows. */
+  backoff(failure: unknown, attempts: number, yielded: boolean): Promise<void>;
+}
 
 /** Session pool plus the driver-owned statement path with bounded retries. */
 export class YdbDriver implements SqlDriver<YdbBinding> {
@@ -47,6 +56,14 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
   #connecting: Promise<void> | undefined;
   #closing: Promise<void> | undefined;
   readonly #admission: Semaphore;
+  /** Bounds leases handed out through acquireConnection(); statements bypass it. */
+  readonly #holding: Semaphore;
+  #held = 0;
+  #tables:
+    | ReturnType<
+        typeof Driver.prototype.createClient<typeof TableServiceDefinition>
+      >
+    | undefined;
   #idle: Session[] = [];
   readonly #leased = new Set<YdbConnection>();
   /** Leases being prepared: admitted, but no handle handed out yet. */
@@ -61,6 +78,10 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
       this.config.maxSessions,
       this.config.maxWaiters,
     );
+    this.#holding = new Semaphore(
+      this.config.maxTransactionSessions,
+      this.config.maxWaiters,
+    );
   }
 
   get stats(): YdbPoolStats {
@@ -68,8 +89,9 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
       maxSessions: this.config.maxSessions,
       idle: this.#idle.length,
       leased: this.#leased.size,
+      held: this.#held,
       creating: this.#pending,
-      waiters: this.#admission.waiters,
+      waiters: this.#admission.waiters + this.#holding.waiters,
       closing: this.#cleanups.size,
     };
   }
@@ -187,14 +209,28 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
     }
   }
 
-  async acquireConnection(requestSignal?: AbortSignal): Promise<YdbConnection> {
+  /**
+   * A lease the caller holds across statements (interactive transactions,
+   * Prisma mutation graphs, explicit connections); counted against
+   * maxTransactionSessions so slow callbacks cannot starve autocommit traffic.
+   */
+  acquireConnection(requestSignal?: AbortSignal): Promise<YdbConnection> {
+    return this.#lease(requestSignal, true);
+  }
+
+  async #lease(
+    requestSignal: AbortSignal | undefined,
+    held: boolean,
+  ): Promise<YdbConnection> {
     if (this.#state !== 'connected' || this.#closing)
       throw new SqlConnectionError('YDB driver is not connected or is closing');
     const started = performance.now();
     const scope = deadline(this.config.acquireTimeoutMs, requestSignal);
+    let hold: (() => void) | undefined;
     let release: (() => void) | undefined;
     let failure: unknown;
     try {
+      if (held) hold = await this.#holding.acquire(scope.signal);
       release = await this.#admission.acquire(scope.signal);
       this.#pending++;
       const session =
@@ -204,19 +240,24 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         throw new SqlConnectionError('YDB driver is closing');
       }
       const lease = release;
+      const unhold = hold;
       const connection = new YdbConnection(session, this, (reusable) => {
         this.#leased.delete(connection);
+        if (unhold) this.#held--;
         if (reusable && this.#fresh(session) && !this.#closing) {
           session.idleSince = Date.now();
           this.#idle.push(session);
         } else if (reusable) this.#retire(session);
         lease();
+        unhold?.();
         this.#notifyDrain();
       });
       this.#leased.add(connection);
+      if (unhold) this.#held++;
       return connection;
     } catch (error) {
       release?.();
+      hold?.();
       failure = normalizeError(
         error,
         'acquire',
@@ -232,45 +273,139 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
     }
   }
 
-  queryYql(request: YdbQueryRequest): AsyncIterable<YdbQueryPart> {
-    return this.#run(request, (connection, attempt) =>
-      connection.queryYql(attempt),
-    );
+  /**
+   * Driver-owned streaming: one lease per attempt, bounded retries within the
+   * request deadline. Nothing is replayed once a part has been yielded.
+   */
+  async *queryYql(request: YdbQueryRequest): AsyncIterable<YdbQueryPart> {
+    const run = this.#plan(request);
+    let yielded = false;
+    try {
+      for (let attempts = 1; ; attempts++) {
+        let connection: YdbConnection | undefined;
+        let failure: unknown;
+        try {
+          run.scope.signal.throwIfAborted();
+          connection = await this.#lease(run.scope.signal, false);
+          for await (const part of connection.queryYql(run.bound())) {
+            yielded = true;
+            yield part;
+          }
+          return;
+        } catch (error) {
+          failure = error;
+        } finally {
+          if (connection) await this.#return(connection);
+        }
+        await run.backoff(failure, attempts, yielded);
+      }
+    } finally {
+      run.scope.dispose();
+    }
   }
 
+  /** Buffered execution with the same lease/retry policy as queryYql. */
   async executeYql(request: YdbQueryRequest): Promise<YdbQueryResult> {
-    for await (const result of this.#run(
-      request,
-      async function* (connection, attempt) {
-        yield await connection.executeYql(attempt);
-      },
-    ))
-      return result;
-    throw new SqlQueryError('YDB query returned no result');
+    const run = this.#plan(request);
+    try {
+      for (let attempts = 1; ; attempts++) {
+        let connection: YdbConnection | undefined;
+        let failure: unknown;
+        try {
+          run.scope.signal.throwIfAborted();
+          connection = await this.#lease(run.scope.signal, false);
+          return await connection.executeYql(run.bound());
+        } catch (error) {
+          failure = error;
+        } finally {
+          if (connection) await this.#return(connection);
+        }
+        await run.backoff(failure, attempts, false);
+      }
+    } finally {
+      run.scope.dispose();
+    }
   }
 
   async *query<Row = Record<string, unknown>>(
     request: YdbSqlExecuteRequest,
   ): AsyncIterable<Row> {
     const project = rowProjector(request.sql);
-    const result = await this.executeYql(sqlRequest(request));
+    const result = await this.executeYql(
+      sqlRequest(request, this.config.readTransactionMode),
+    );
     for (const set of result.resultSets)
       for (const row of set?.rows ?? []) yield project(row) as Row;
   }
 
   async execute(request: YdbSqlExecuteRequest): Promise<SqlStatementStats> {
-    const result = await this.executeYql(sqlRequest(request, true));
+    const result = await this.executeYql(
+      sqlRequest(request, this.config.readTransactionMode, true),
+    );
     return { affectedRows: result.affectedRows };
   }
 
   /**
-   * Driver-owned execution: one lease per attempt, bounded retries within the
-   * request deadline. Nothing is replayed once a part has been yielded.
+   * Rows as they arrive, without the buffered result bounds. Retries stop at
+   * the first row; abandoning the iterator cancels the RPC and discards its session.
    */
-  async *#run<T>(
-    request: YdbQueryRequest,
-    attempt: Attempt<T>,
-  ): AsyncIterable<T> {
+  async *stream<Row = Record<string, unknown>>(
+    request: YdbSqlExecuteRequest,
+  ): AsyncIterable<Row> {
+    const project = rowProjector(request.sql);
+    for await (const part of this.queryYql(
+      sqlRequest(request, this.config.readTransactionMode),
+    ))
+      for (const row of part.rows) yield project(row) as Row;
+  }
+
+  /** TableService BulkUpsert: idempotent, outside any transaction, retried like a read. */
+  async bulkUpsert(request: YdbBulkUpsertRequest): Promise<void> {
+    const rows = encodeParameters({ rows: request.rows })['$rows'];
+    const table = request.table.startsWith('/')
+      ? request.table
+      : `${this.core.database}/${request.table}`;
+    const run = this.#plan({
+      text: '',
+      signal: request.signal,
+      timeoutMs: request.timeoutMs,
+      idempotent: true,
+      retry: request.retry,
+    });
+    const started = performance.now();
+    let failure: unknown;
+    try {
+      for (let attempts = 1; ; attempts++) {
+        try {
+          run.scope.signal.throwIfAborted();
+          this.#tables ??= this.core.createClient(TableServiceDefinition);
+          const response = await this.#tables.bulkUpsert(
+            { table, rows },
+            { signal: run.scope.signal },
+          );
+          checkOperation(response.operation);
+          return;
+        } catch (error) {
+          failure = normalizeError(
+            error,
+            'bulk upsert',
+            false,
+            this.config.includeServerIssues,
+          );
+        }
+        await run.backoff(failure, attempts, false);
+        failure = undefined;
+      }
+    } catch (error) {
+      failure = error;
+      throw error;
+    } finally {
+      run.scope.dispose();
+      emit(this, 'bulk-upsert', started, failure);
+    }
+  }
+
+  #plan(request: YdbQueryRequest): Run {
     const timeout = request.timeoutMs ?? this.config.queryTimeoutMs;
     const scope = deadline(timeout, request.signal);
     const expires = performance.now() + timeout;
@@ -279,29 +414,14 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
       request.idempotent === true ||
       request.transactionMode === 'snapshotReadOnly' ||
       isCompilerSelect(request.text);
-    let yielded = false;
-    try {
-      for (let attempts = 1; ; attempts++) {
-        let connection: YdbConnection | undefined;
-        let failure: unknown;
-        try {
-          scope.signal.throwIfAborted();
-          connection = await this.acquireConnection(scope.signal);
-          const bounded: YdbQueryRequest = {
-            ...request,
-            signal: scope.signal,
-            timeoutMs: Math.max(1, Math.ceil(expires - performance.now())),
-          };
-          for await (const item of attempt(connection, bounded)) {
-            yielded = true;
-            yield item;
-          }
-          return;
-        } catch (error) {
-          failure = error;
-        } finally {
-          if (connection) await this.#return(connection);
-        }
+    return {
+      scope,
+      bound: () => ({
+        ...request,
+        signal: scope.signal,
+        timeoutMs: Math.max(1, Math.ceil(expires - performance.now())),
+      }),
+      backoff: async (failure, attempts, yielded) => {
         const retryable =
           policy &&
           !yielded &&
@@ -313,10 +433,8 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         if (delay + 1 >= expires - performance.now()) throw failure;
         emit(this, 'retry', performance.now(), failure, attempts + 1);
         if (delay) await sleep(delay, scope.signal);
-      }
-    } finally {
-      scope.dispose();
-    }
+      },
+    };
   }
 
   #retryPolicy(request: YdbQueryRequest): false | Required<YdbRetryOptions> {
@@ -441,6 +559,7 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
 
   async #close(timeoutMs: number): Promise<void> {
     this.#admission.close();
+    this.#holding.close();
     clearInterval(this.#sweep);
     const scope = deadline(timeoutMs);
     let abandoned: number | undefined;

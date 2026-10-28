@@ -4,7 +4,9 @@ import {
   ColumnRef,
   NullCheckExpr,
   ProjectionItem,
+  RawExpr,
   SubqueryExpr,
+  TableSource,
   WindowFuncExpr,
   type AnyExpression,
   type AnyFromSource,
@@ -23,6 +25,61 @@ export interface RelationRenderContext {
   order(items: readonly OrderByItem[]): string;
   quote(identifier: string): string;
   nextAlias(): string;
+  /**
+   * How `columns` can be looked up on `source`: the secondary index to read
+   * through, `'primary'` for a primary-key prefix, or undefined for a scan.
+   */
+  keyPath(source: TableSource, columns: readonly string[]): string | undefined;
+  /** Materialize the outer query's parent keys as a named YQL expression, when the outer shape allows it. */
+  parentKeys(
+    outer: SelectAst,
+    parents: readonly ColumnRef[],
+  ): string | undefined;
+  /** Render `source` as `table VIEW index` in this statement. */
+  useView(source: TableSource, index: string): void;
+}
+
+/**
+ * Restrict a child query to the parents the outer query selects. Without it a
+ * grouped include scans the whole child table; with a key path YDB performs
+ * index or primary-key lookups for the selected parents only.
+ */
+function restrictToParents(
+  outer: SelectAst,
+  child: SelectAst,
+  pairs: Correlation['pairs'],
+  context: RelationRenderContext,
+): SelectAst {
+  const source = child.from;
+  if (!(source instanceof TableSource)) return child;
+  const path = context.keyPath(
+    source,
+    pairs.map((pair) => pair.child.column),
+  );
+  if (!path) return child;
+  const keys = context.parentKeys(
+    outer,
+    pairs.map((pair) => pair.parent),
+  );
+  if (!keys) return child;
+  if (path !== 'primary') context.useView(source, path);
+  const parts: (string | AnyExpression)[] =
+    pairs.length === 1
+      ? [pairs[0].child, ` IN ${keys}`]
+      : [
+          'AsTuple(',
+          ...pairs.flatMap((pair, index) =>
+            index ? [', ', pair.child] : [pair.child],
+          ),
+          `) IN ${keys}`,
+        ];
+  const membership = new RawExpr({
+    parts,
+    returns: { codecId: 'ydb/bool@1', nullable: false },
+  });
+  return child.withWhere(
+    child.where ? AndExpr.of([child.where, membership]) : membership,
+  );
 }
 
 export interface LoweredRelationIncludes {
@@ -319,8 +376,12 @@ export function lowerRelationIncludes(
       const groupedAlias = context.nextAlias();
       const keys = correlation.pairs.map(() => context.nextAlias());
       const valueAlias = context.nextAlias();
-      const grouped = aggregate
-        .withWhere(correlation.predicate)
+      const grouped = restrictToParents(
+        ast,
+        aggregate.withWhere(correlation.predicate),
+        correlation.pairs,
+        context,
+      )
         .withOrderBy([])
         .withProjection([
           ProjectionItem.of(valueAlias, envelope),
@@ -398,8 +459,12 @@ export function lowerRelationIncludes(
           }),
         ),
       );
-    const uncorrelated = child
-      .withWhere(correlation.predicate)
+    const uncorrelated = restrictToParents(
+      ast,
+      child.withWhere(correlation.predicate),
+      correlation.pairs,
+      context,
+    )
       .withLimit(undefined)
       .withOffset(undefined)
       .withOrderBy([])

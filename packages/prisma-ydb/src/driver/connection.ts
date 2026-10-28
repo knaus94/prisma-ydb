@@ -28,19 +28,22 @@ import { emit, type EventSink } from './events.js';
 import type { Options } from './options.js';
 import type { Session } from './session.js';
 import type {
+  YdbBeginTransactionOptions,
   YdbQueryPart,
   YdbQueryRequest,
   YdbQueryResult,
   YdbResultSet,
   YdbSqlExecuteRequest,
+  YdbTransactionMode,
 } from './types.js';
 import {
-  decodeValue,
   encodeParameters,
+  estimateRowSize,
   isCompilerSelect,
-  estimateSize,
+  rowPlan,
   rowProjector,
   sqlRequest,
+  type RowPlan,
 } from './values.js';
 
 type TransactionMode = NonNullable<YdbQueryRequest['transactionMode']>;
@@ -56,13 +59,35 @@ export function transactionModeOf(
     : 'serializable';
 }
 
+const serializable = { case: 'serializableReadWrite', value: {} } as const;
+const snapshot = { case: 'snapshotReadOnly', value: {} } as const;
+
+/**
+ * Interactive transactions begin on the server with their first statement
+ * (`beginTx`) and may commit with their last one (`commitTx`), so a callback
+ * of N statements costs at most N + 1 round trips, and an empty one costs none.
+ */
 function txControl(
   mode: TransactionMode,
-  transaction: { id: string } | undefined,
+  transaction: ActiveTransaction | undefined,
+  commit: boolean,
 ): Pick<MessageInitShape<typeof ExecuteQueryRequestSchema>, 'txControl'> {
   if (transaction)
     return {
-      txControl: { txSelector: { case: 'txId', value: transaction.id } },
+      txControl: {
+        commitTx: commit,
+        txSelector: transaction.id
+          ? { case: 'txId', value: transaction.id }
+          : {
+              case: 'beginTx',
+              value: {
+                txMode:
+                  transaction.mode === 'snapshotReadOnly'
+                    ? snapshot
+                    : serializable,
+              },
+            },
+      },
     };
   if (mode === 'implicit') return {};
   return {
@@ -71,51 +96,43 @@ function txControl(
       txSelector: {
         case: 'beginTx',
         value: {
-          txMode:
-            mode === 'snapshotReadOnly'
-              ? { case: 'snapshotReadOnly', value: {} }
-              : { case: 'serializableReadWrite', value: {} },
+          txMode: mode === 'snapshotReadOnly' ? snapshot : serializable,
         },
       },
     },
   };
 }
 
-/** Decode one streamed part with a column plan built once, not once per cell. */
+/** Decode one streamed part; the column plan is built once per result set, not per part or cell. */
 function decodePart(
   part: ExecuteQueryResponsePart,
   wire: boolean,
+  plans: Map<number, RowPlan>,
 ): YdbQueryPart {
-  if (part.resultSet?.truncated)
+  const resultSetIndex = Number(part.resultSetIndex);
+  const set = part.resultSet;
+  if (!set)
+    return { resultSetIndex, columns: [], rows: [], stats: part.execStats };
+  if (set.truncated)
     throw new SqlQueryError('YDB truncated the result; paginate the query');
-  const columns = part.resultSet?.columns ?? [];
-  const names = new Set<string>();
-  const plan = columns.map((column) => {
-    const type = column.type;
-    if (!type) throw new SqlQueryError('YDB returned an invalid row');
-    if (names.has(column.name))
-      throw new SqlQueryError(
-        'YDB returned duplicate column names; use aliases',
-      );
-    names.add(column.name);
-    return { name: column.name, type };
-  });
-  const rows = (part.resultSet?.rows ?? []).map((row) => {
+  let plan = plans.get(resultSetIndex);
+  if (!plan || plan.names.length !== set.columns.length) {
+    plan = rowPlan(set.columns, wire);
+    plans.set(resultSetIndex, plan);
+  }
+  const { names, decoders } = plan;
+  const rows = new Array<Record<string, unknown>>(set.rows.length);
+  for (let r = 0; r < set.rows.length; r++) {
+    const items = set.rows[r].items;
     const object: Record<string, unknown> = Object.create(null);
-    for (let index = 0; index < plan.length; index++) {
-      const value = row.items[index];
+    for (let index = 0; index < names.length; index++) {
+      const value = items[index];
       if (!value) throw new SqlQueryError('YDB returned an invalid row');
-      const { name, type } = plan[index];
-      object[name] = wire ? value : decodeValue(value, type);
+      object[names[index]] = decoders[index](value);
     }
-    return object;
-  });
-  return {
-    resultSetIndex: Number(part.resultSetIndex),
-    columns,
-    rows,
-    stats: part.execStats,
-  };
+    rows[r] = object;
+  }
+  return { resultSetIndex, columns: set.columns, rows, stats: part.execStats };
 }
 
 async function collect(
@@ -124,6 +141,7 @@ async function collect(
   config: Options,
 ): Promise<YdbQueryResult> {
   const resultSets: YdbResultSet[] = [];
+  const plans: RowPlan[] = [];
   let stats: QueryStats | undefined;
   let rowCount = 0;
   let bytes = 0;
@@ -138,13 +156,16 @@ async function collect(
     )
       throw new SqlQueryError('YDB returned an invalid result-set index');
     let target = resultSets[part.resultSetIndex];
-    if (!target)
+    if (!target) {
       resultSets[part.resultSetIndex] = target = {
         columns: part.columns,
         rows: [],
       };
+      plans[part.resultSetIndex] = rowPlan(part.columns, true);
+    }
+    const plan = plans[part.resultSetIndex];
     for (const row of part.rows) {
-      bytes += estimateSize(row);
+      bytes += estimateRowSize(row, plan);
       if (++rowCount > config.maxResultRows || bytes > config.maxResultBytes)
         throw new SqlQueryError(
           'YDB buffered result limit exceeded; use queryYql streaming or paginate the query',
@@ -159,10 +180,15 @@ async function collect(
   };
 }
 
-interface ActiveTransaction {
-  readonly id: string;
+/** @internal Transaction state owned by a connection; YdbTransaction is its public handle. */
+export interface ActiveTransaction {
+  /** Server transaction id; assigned by the first statement's response. */
+  id: string | undefined;
+  readonly mode: YdbTransactionMode;
   readonly deadline: Scope;
   failed: boolean;
+  /** Set when a statement carried `commit: true` and succeeded. */
+  committed: boolean;
 }
 
 /** A pooled session lease. Serial by construction: one statement at a time. */
@@ -224,11 +250,15 @@ export class YdbConnection implements SqlConnection {
   }
 
   #activeTransaction(
-    expectedId: string | undefined,
+    expected: ActiveTransaction | undefined,
   ): ActiveTransaction | undefined {
     const transaction = this.#transaction;
-    if (expectedId !== undefined && transaction?.id !== expectedId)
-      throw new SqlQueryError('YDB transaction handle is no longer active');
+    if (expected !== undefined && transaction !== expected)
+      throw new SqlQueryError(
+        expected.committed
+          ? 'YDB transaction has already been committed by a statement'
+          : 'YDB transaction handle is no longer active',
+      );
     if (transaction?.failed)
       throw new SqlQueryError(
         'YDB transaction failed; roll it back before issuing another query',
@@ -236,22 +266,29 @@ export class YdbConnection implements SqlConnection {
     return transaction;
   }
 
+  #settle(transaction: ActiveTransaction): void {
+    transaction.deadline.dispose();
+    if (this.#transaction === transaction) this.#transaction = undefined;
+  }
+
   async *queryYql(
     request: YdbQueryRequest,
-    expectedTransactionId?: string,
+    expected?: ActiveTransaction,
   ): AsyncIterable<YdbQueryPart> {
     this.#assertOpen();
     const mode = transactionModeOf(request, this.#config);
     // Validate before opening the RPC; validation failure does not taint a session.
     const parameters = encodeParameters(request.parameters);
     const started = performance.now();
-    const cancel = new AbortController();
     const scope = deadline(
       request.timeoutMs ?? this.#config.queryTimeoutMs,
       request.signal,
       this.#session.life.signal,
     );
-    let rpc: Scope | undefined;
+    const plans = new Map<number, RowPlan>();
+    const wire = request.valueMode === 'wire';
+    // Whether this statement may commit, which makes uncertain failures outcomeUnknown.
+    let commits = mode !== 'snapshotReadOnly';
     let release: (() => void) | undefined;
     // 'streaming' means the server has not sent a terminal status yet.
     let phase: 'pending' | 'streaming' | 'terminal' = 'pending';
@@ -260,14 +297,15 @@ export class YdbConnection implements SqlConnection {
       release = await this.#lock(scope.signal);
       this.#busy++;
       this.#assertOpen();
-      const transaction = this.#activeTransaction(expectedTransactionId);
-      rpc = deadline(
-        undefined,
-        scope.signal,
-        cancel.signal,
-        transaction?.deadline.signal,
-      );
-      rpc.signal.throwIfAborted();
+      const transaction = this.#activeTransaction(expected);
+      const commit = request.commit === true;
+      if (commit && !transaction)
+        throw new SqlQueryError(
+          'YDB commit-with-statement requires an active transaction',
+        );
+      if (transaction) commits = commit;
+      scope.follow(transaction?.deadline.signal);
+      scope.signal.throwIfAborted();
       phase = 'streaming';
       const parts = this.#session.client.executeQuery(
         {
@@ -282,24 +320,30 @@ export class YdbConnection implements SqlConnection {
             (request.stats ?? this.#config.statsMode) === 'basic'
               ? StatsMode.BASIC
               : StatsMode.NONE,
-          ...txControl(mode, transaction),
+          ...txControl(mode, transaction, commit),
         },
-        { signal: rpc.signal },
+        { signal: scope.signal },
       );
       for await (const part of parts) {
+        if (transaction && !transaction.id && part.txMeta?.id)
+          transaction.id = part.txMeta.id;
         if (part.status !== Status.SUCCESS) {
           // A failure status ends the stream; the session itself stays usable.
           phase = 'terminal';
           checkStatus(part);
         }
-        yield decodePart(part, request.valueMode === 'wire');
+        yield decodePart(part, wire, plans);
       }
       phase = 'terminal';
+      if (transaction && commit) {
+        transaction.committed = true;
+        this.#settle(transaction);
+      }
     } catch (error) {
       failure = normalizeError(
         error,
         'query',
-        !this.#transaction && mode !== 'snapshotReadOnly',
+        commits,
         this.#config.includeServerIssues,
       );
       if (phase !== 'pending' && this.#transaction)
@@ -309,15 +353,15 @@ export class YdbConnection implements SqlConnection {
     } finally {
       if (phase === 'streaming') {
         // Cancelled before the terminal status: the server-side outcome is unknown.
-        cancel.abort();
+        scope.abort(new Error('YDB query stream was abandoned'));
         this.#tainted = true;
+        if (this.#transaction) this.#transaction.failed = true;
       }
       if (release) {
         this.#busy--;
         release();
       }
       scope.dispose();
-      rpc?.dispose();
       emit(
         this.#sink,
         'query',
@@ -332,25 +376,21 @@ export class YdbConnection implements SqlConnection {
 
   executeYql(
     request: YdbQueryRequest,
-    expectedTransactionId?: string,
+    expected?: ActiveTransaction,
   ): Promise<YdbQueryResult> {
-    return collect(
-      this.queryYql(request, expectedTransactionId),
-      request,
-      this.#config,
-    );
+    return collect(this.queryYql(request, expected), request, this.#config);
   }
 
   async *query<Row = Record<string, unknown>>(
     request: YdbSqlExecuteRequest,
-    expectedTransactionId?: string,
+    expected?: ActiveTransaction,
   ): AsyncIterable<Row> {
     this.#streams++;
     try {
       const project = rowProjector(request.sql);
       const result = await this.executeYql(
-        sqlRequest(request),
-        expectedTransactionId,
+        sqlRequest(request, this.#config.readTransactionMode),
+        expected,
       );
       for (const set of result.resultSets)
         for (const row of set?.rows ?? []) yield project(row) as Row;
@@ -361,58 +401,73 @@ export class YdbConnection implements SqlConnection {
 
   async execute(
     request: YdbSqlExecuteRequest,
-    expectedTransactionId?: string,
+    expected?: ActiveTransaction,
   ): Promise<SqlStatementStats> {
     const result = await this.executeYql(
-      sqlRequest(request, true),
-      expectedTransactionId,
+      sqlRequest(request, this.#config.readTransactionMode, true),
+      expected,
     );
     return { affectedRows: result.affectedRows };
   }
 
-  beginTransaction(): Promise<YdbTransaction> {
-    return this.#operation('begin', async (signal) => {
+  /** Local only: the server transaction starts with the first statement. */
+  beginTransaction(
+    options: YdbBeginTransactionOptions = {},
+  ): Promise<YdbTransaction> {
+    return this.#operation('begin', async () => {
       this.#assertOpen();
       if (this.#transaction)
         throw new SqlQueryError('Nested YDB transactions are not supported');
-      const response = await this.#session.client.beginTransaction(
-        {
-          sessionId: this.#session.id,
-          txSettings: { txMode: { case: 'serializableReadWrite', value: {} } },
-        },
-        { signal },
-      );
-      checkStatus(response);
-      const id = response.txMeta?.id;
-      if (!id)
-        throw new SqlQueryError('YDB did not return a transaction identifier');
-      this.#transaction = {
-        id,
+      const mode = options.mode ?? 'serializable';
+      if (mode !== 'serializable' && mode !== 'snapshotReadOnly')
+        throw new SqlQueryError('Unsupported YDB transaction mode');
+      const transaction: ActiveTransaction = {
+        id: undefined,
+        mode,
         deadline: deadline(this.#config.transactionTimeoutMs),
         failed: false,
+        committed: false,
       };
-      return new YdbTransaction(this, id);
+      this.#transaction = transaction;
+      return new YdbTransaction(this, transaction);
     });
   }
 
-  async finishTransaction(id: string, commit: boolean): Promise<void> {
+  async finishTransaction(
+    handle: ActiveTransaction,
+    commit: boolean,
+  ): Promise<void> {
     await this.#operation(commit ? 'commit' : 'rollback', async (signal) => {
       const transaction = this.#transaction;
-      if (!transaction || transaction.id !== id)
-        throw new SqlQueryError('YDB transaction is no longer active');
+      if (transaction !== handle) {
+        // A statement-level commit already settled it; a repeated commit is idempotent.
+        if (handle.committed && commit) return;
+        throw new SqlQueryError(
+          handle.committed
+            ? 'YDB transaction has already been committed by a statement'
+            : 'YDB transaction is no longer active',
+        );
+      }
       if (commit && (transaction.failed || transaction.deadline.signal.aborted))
         throw new SqlQueryError(
           'Failed or expired YDB transactions must be rolled back',
         );
-      const request = { sessionId: this.#session.id, txId: id };
+      // A tainted session cannot vouch for its statements; never commit locally.
+      if (commit) this.#assertOpen();
+      // Nothing reached the server: there is no transaction to settle remotely.
+      if (!transaction.id) {
+        this.#settle(transaction);
+        return;
+      }
+      const request = { sessionId: this.#session.id, txId: transaction.id };
       const response = commit
         ? await this.#session.client.commitTransaction(request, { signal })
         : await this.#session.client.rollbackTransaction(request, { signal });
       // ABORTED/NOT_FOUND acknowledge that no live transaction remains to roll back.
       if (commit || !rolledBackStatuses.has(response.status))
         checkStatus(response);
-      transaction.deadline.dispose();
-      this.#transaction = undefined;
+      if (commit) transaction.committed = true;
+      this.#settle(transaction);
     });
   }
 
@@ -516,29 +571,39 @@ export class YdbConnection implements SqlConnection {
 }
 
 export class YdbTransaction implements SqlTransaction {
-  constructor(
-    private readonly connection: YdbConnection,
-    private readonly id: string,
-  ) {}
+  readonly #connection: YdbConnection;
+  readonly #handle: ActiveTransaction;
+  /** @internal Created by YdbConnection.beginTransaction(). */
+  constructor(connection: YdbConnection, handle: ActiveTransaction) {
+    this.#connection = connection;
+    this.#handle = handle;
+  }
+  /** True once a statement with `commit: true` or commit() succeeded. */
+  get committed(): boolean {
+    return this.#handle.committed;
+  }
+  get mode(): YdbTransactionMode {
+    return this.#handle.mode;
+  }
   query<Row = Record<string, unknown>>(
     request: YdbSqlExecuteRequest,
   ): AsyncIterable<Row> {
-    return this.connection.query<Row>(request, this.id);
+    return this.#connection.query<Row>(request, this.#handle);
   }
   execute(request: YdbSqlExecuteRequest): Promise<SqlStatementStats> {
-    return this.connection.execute(request, this.id);
+    return this.#connection.execute(request, this.#handle);
   }
   queryYql(request: YdbQueryRequest): AsyncIterable<YdbQueryPart> {
-    return this.connection.queryYql(request, this.id);
+    return this.#connection.queryYql(request, this.#handle);
   }
   executeYql(request: YdbQueryRequest): Promise<YdbQueryResult> {
-    return this.connection.executeYql(request, this.id);
+    return this.#connection.executeYql(request, this.#handle);
   }
   commit(): Promise<void> {
-    return this.connection.finishTransaction(this.id, true);
+    return this.#connection.finishTransaction(this.#handle, true);
   }
   rollback(): Promise<void> {
-    return this.connection.finishTransaction(this.id, false);
+    return this.#connection.finishTransaction(this.#handle, false);
   }
 }
 

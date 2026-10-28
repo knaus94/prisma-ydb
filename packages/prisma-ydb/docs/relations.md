@@ -114,6 +114,14 @@ The compiler uses the mapping `Task.projectId = Project.id`. Nested results use
 YQL joins and typed lists/structs. These queries need relation metadata, but they
 do not require a database FK or repair inconsistent data.
 
+When the child's foreign key columns prefix a secondary index (`@@index([projectId])`)
+or its primary key, the compiler first materializes the selected parents' keys
+(`$__prisma_ydb_keys_N`, honoring the outer filter, order and pagination) and
+reads the children through `VIEW index WHERE fk IN $keys`: an index lookup of
+only the relevant children instead of a scan of the whole child table. Without
+such an index the include scans the child table, so index the foreign key of
+every relation you include at scale.
+
 An optional relation returns `project: null` when no parent is found. This can
 mean either `projectId` is null or it contains a dangling reference. Select
 `projectId` as well when diagnosing the difference. A to-many relation with no

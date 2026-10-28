@@ -7,6 +7,7 @@ import type {
 import { TableSource } from '@prisma/orm-family-sql/relational-core/ast';
 import { runtimeError } from '@prisma/orm-framework/components/runtime';
 import { yqlTypeForCodec } from './codecs.js';
+import { lookupIndex } from './keys.js';
 
 interface Relation {
   namespace: string;
@@ -27,22 +28,6 @@ const actionGraphs = new WeakMap<Contract<SqlStorage>, ActionGraph>();
 const noRelations: readonly Relation[] = [];
 function tableKey(namespace: string, name: string): string {
   return `${namespace}\0${name}`;
-}
-function lookupIndex(
-  table: StorageTable | undefined,
-  columns: readonly string[],
-): string | undefined {
-  if (
-    columns.every(
-      (column, index) => table?.primaryKey?.columns[index] === column,
-    )
-  )
-    return undefined;
-  return table?.indexes.find(
-    (index) =>
-      !index.where &&
-      columns.every((column, position) => index.columns?.[position] === column),
-  )?.name;
 }
 function actionGraph(contract: Contract<SqlStorage>): ActionGraph {
   const cached = actionGraphs.get(contract);

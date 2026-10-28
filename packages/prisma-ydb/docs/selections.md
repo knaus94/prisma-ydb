@@ -100,9 +100,10 @@ See [NestJS integration](nestjs.md), [relations](relations.md) and the
 For example, a prepared selection can execute on the client or a live transaction:
 
 ```ts
-const byId = await db.prepare(
-  { id: 'ydb/utf8@1' } as const,
-  (p) => db.orm.Task.with(select.task).where((row) => row.id.eq(p.id)).prepared.first(),
+const byId = await db.prepare({ id: 'ydb/utf8@1' } as const, (p) =>
+  db.orm.Task.with(select.task)
+    .where((row) => row.id.eq(p.id))
+    .prepared.first(),
 );
 const task = await byId.query(db, { id: taskId });
 await db.transaction(async (tx) => {

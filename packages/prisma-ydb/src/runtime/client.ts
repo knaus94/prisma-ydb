@@ -44,6 +44,11 @@ import {
 } from '@prisma/orm-family-sql/runtime';
 import { SqlConnectionError } from '@prisma/orm-family-sql/errors';
 import {
+  preparedStatementExecute,
+  preparedStatementQuery,
+} from '@prisma/orm-family-sql/runtime/internal/prepared-query';
+import { sleep } from '../driver/abort.js';
+import {
   YdbDriver,
   isRetryableYdbError,
   retryDefaults,
@@ -55,8 +60,19 @@ import {
   type YdbParameter,
   type YdbQueryRequest,
   type YdbQueryResult,
+  type YdbTransactionMode,
 } from '../driver/index.js';
 import { ydbContractSerializer } from '../control/contract.js';
+import {
+  bulkUpsertModel,
+  type YdbBulkUpsertOptions,
+  type YdbBulkUpsertResult,
+} from './bulk.js';
+import {
+  readChangefeed,
+  type YdbChangeBatch,
+  type YdbChangefeedOptions,
+} from './changefeed.js';
 import { YdbJsonElement } from './codecs.js';
 import {
   createYdbRuntimeAdapter,
@@ -111,15 +127,44 @@ export interface YdbTransactionContext<
 }
 export interface YdbTransactionOptions {
   readonly retry?: boolean | { readonly maxAttempts?: number };
+  /**
+   * `snapshotReadOnly` reads one consistent snapshot without conflicting with
+   * writers; the server rejects writes inside it. Default: `serializable`.
+   */
+  readonly mode?: YdbTransactionMode;
 }
+/** Rows of one model keyed by field name; list fields take arrays. */
+export type YdbModelRows = readonly Readonly<Record<string, unknown>>[];
 
 export interface YdbClient<C extends Contract<SqlStorage>>
   extends YdbQueryMembers<C>, YdbClientLifecycle<C> {}
 interface YdbClientLifecycle<C extends Contract<SqlStorage>> {
   readonly contract: C;
   readonly context: ExecutionContext<C>;
+  /**
+   * The same ORM/SQL/raw lanes streaming rows as the server sends them, without
+   * the buffered result bounds. Abandoning an iterator early cancels the RPC
+   * and discards its session, so prefer it for full scans you consume entirely.
+   */
+  readonly streaming: YdbQueryMembers<C>;
   connect(binding?: YdbBinding): Promise<Runtime>;
   runtime(): Runtime;
+  /**
+   * TableService BulkUpsert of encoded model rows: idempotent, chunked and
+   * outside any transaction. Bypasses temporal presets and referential actions.
+   */
+  bulkUpsert(
+    model: keyof C['domain']['namespaces'][keyof C['domain']['namespaces']]['models'] &
+      string,
+    rows: YdbModelRows,
+    options?: YdbBulkUpsertOptions,
+  ): Promise<YdbBulkUpsertResult>;
+  /** Decoded change batches from a managed `@@changefeed` topic. */
+  changefeed(
+    model: keyof C['domain']['namespaces'][keyof C['domain']['namespaces']]['models'] &
+      string,
+    options: YdbChangefeedOptions,
+  ): AsyncIterable<YdbChangeBatch>;
   transaction<T>(
     callback: (tx: YdbTransactionContext<C>) => PromiseLike<T>,
     options?: YdbTransactionOptions,
@@ -178,6 +223,36 @@ class YdbRuntime<C extends Contract<SqlStorage>> extends SqlRuntimeBase<C> {
   }
 }
 
+/**
+ * Prepared handles execute through these symbol methods of the pinned SQL
+ * runtime; they are internal Prisma API, re-exported by name rather than
+ * discovered by scanning the prototype.
+ */
+const preparedBridges = [preparedStatementQuery, preparedStatementExecute];
+
+/**
+ * The pinned Prisma RC has no public API for two things this client relies on:
+ * the prepared-statement bridge and the per-runtime codec-validation flag that
+ * lets transaction runtimes skip repeating the contract check. Fail at client
+ * construction, not under load, if an upgrade moved either of them.
+ */
+function assertPinnedRuntimeShape(runtime: object): void {
+  for (const key of preparedBridges)
+    if (typeof Reflect.get(runtime, key) !== 'function')
+      throw new Error(
+        `prisma-ydb: the pinned Prisma runtime no longer exposes ${key.description}; upgrade prisma-ydb together with @prisma/orm-family-sql`,
+      );
+  if (typeof Reflect.get(runtime, 'codecRegistryValidated') !== 'boolean')
+    throw new Error(
+      'prisma-ydb: the pinned Prisma runtime no longer exposes codecRegistryValidated; upgrade prisma-ydb together with @prisma/orm-family-sql',
+    );
+}
+
+/** The contract was validated once by the root runtime; transaction runtimes share that result. */
+function markCodecsValidated(runtime: object): void {
+  Reflect.set(runtime, 'codecRegistryValidated', true);
+}
+
 const transactionPrimaryFailures = new WeakMap<Error, unknown>();
 
 function transactionFailure(
@@ -230,6 +305,8 @@ export function ydb<C extends Contract<SqlStorage>>(
   let markerRead: Promise<MarkerReadResult> | undefined;
   let markerReported = false;
   let codecRegistryValidated = false;
+  /** Aborted by close(); interrupts retry pauses that hold no session. */
+  const shutdown = new AbortController();
 
   const ensureConnected = async (allowClosing = false) => {
     if (closed && !allowClosing) throw new Error('YDB client is closed');
@@ -292,6 +369,7 @@ export function ydb<C extends Contract<SqlStorage>>(
       closeRefusal: 'at-once',
     });
   const runtime = makeRuntime(driver);
+  assertPinnedRuntimeShape(runtime);
   const members = (
     boundRuntime: Runtime,
     native: { executeYql(request: YdbQueryRequest): Promise<YdbQueryResult> },
@@ -317,14 +395,15 @@ export function ydb<C extends Contract<SqlStorage>>(
         context,
         runtime: {
           ...scoped,
-          ...(boundRuntime === runtime
-            ? {
+          // Root and streaming lanes own their connections; a transaction lane joins its held one.
+          ...(failMutationScope
+            ? {}
+            : {
                 connection: async () => {
                   await warmMarker();
-                  return runtime.connection();
+                  return boundRuntime.connection();
                 },
-              }
-            : {}),
+              }),
           ...(failMutationScope
             ? {
                 transaction: async () => {
@@ -406,11 +485,10 @@ export function ydb<C extends Contract<SqlStorage>>(
         return result.resultSets.flatMap((set) => set.rows);
       },
     };
-    // The pinned SQL runtime exposes prepared execution through symbol methods.
-    // Forward those capabilities without importing its private symbol module.
-    for (const key of Object.getOwnPropertySymbols(SqlRuntimeBase.prototype)) {
-      const bridge: unknown = Reflect.get(boundRuntime, key);
-      if (typeof bridge !== 'function') continue;
+    for (const key of preparedBridges) {
+      const bridge = Reflect.get(boundRuntime, key) as (
+        ...args: unknown[]
+      ) => unknown;
       Object.defineProperty(result, key, {
         value: (...args: unknown[]) => {
           checkActive();
@@ -420,9 +498,22 @@ export function ydb<C extends Contract<SqlStorage>>(
     }
     return result;
   };
-  const rootMembers = members(runtime, nativeDriver, () => {
+  const checkClosed = () => {
     if (closed) throw new Error('YDB client is closed');
-  });
+  };
+  const rootMembers = members(runtime, nativeDriver, checkClosed);
+  let streaming: YdbQueryMembers<C> | undefined;
+  const createStreaming = () => {
+    const streamingDriver: SqlDriver<unknown> = {
+      ...driver,
+      async *query<Row>(request: SqlExecuteRequest) {
+        await ensureConnected(true);
+        yield* nativeDriver.stream<Row>(request);
+      },
+      close: async () => undefined,
+    };
+    return members(makeRuntime(streamingDriver), nativeDriver, checkClosed);
+  };
   const lifecycle: YdbClientLifecycle<C> = {
     contract,
     context,
@@ -437,6 +528,25 @@ export function ydb<C extends Contract<SqlStorage>>(
     runtime() {
       if (closed) throw new Error('YDB client is closed');
       return runtime;
+    },
+    get streaming() {
+      return (streaming ??= createStreaming());
+    },
+    async bulkUpsert(model, rows, bulkOptions) {
+      checkClosed();
+      await ensureConnected();
+      return bulkUpsertModel(nativeDriver, contract, model, rows, bulkOptions);
+    },
+    async *changefeed(model, feedOptions) {
+      checkClosed();
+      await ensureConnected();
+      yield* readChangefeed(
+        nativeDriver,
+        contract,
+        model,
+        feedOptions,
+        shutdown.signal,
+      );
     },
     prepare<
       D extends Declaration<CT>,
@@ -465,6 +575,7 @@ export function ydb<C extends Contract<SqlStorage>>(
     close() {
       if (!closing) {
         closed = true;
+        shutdown.abort(new Error('YDB client is closed'));
         closeDeadline = performance.now() + nativeDriver.config.closeTimeoutMs;
         closing = (async () => {
           const drain = (async () => {
@@ -518,10 +629,15 @@ export function ydb<C extends Contract<SqlStorage>>(
       retry === true ? 5 : retry ? (retry.maxAttempts ?? 5) : 1;
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1)
       throw new TypeError('Transaction maxAttempts must be a positive integer');
+    const mode = transactionOptions?.mode ?? 'serializable';
+    if (mode !== 'serializable' && mode !== 'snapshotReadOnly')
+      throw new TypeError(
+        'Transaction mode must be serializable or snapshotReadOnly',
+      );
     for (let attempt = 1; ; attempt++) {
       const state = { committed: false };
       try {
-        return await runTransaction<T>(callback, state);
+        return await runTransaction<T>(callback, state, mode);
       } catch (error) {
         const primary = primaryTransactionFailure(error);
         if (
@@ -530,22 +646,28 @@ export function ydb<C extends Contract<SqlStorage>>(
           !isRetryableYdbError(primary, false)
         )
           throw error;
-        await new Promise<void>((resolve) =>
-          setTimeout(
-            resolve,
-            retryDelayMs(
-              primary,
-              attempt,
-              nativeDriver.config.retry || retryDefaults,
-            ),
-          ),
+        const delay = retryDelayMs(
+          primary,
+          attempt,
+          nativeDriver.config.retry || retryDefaults,
         );
+        // The pause ends early when the client closes; nothing is replayed then.
+        if (delay)
+          try {
+            await sleep(delay, shutdown.signal);
+          } catch {
+            throw new SqlConnectionError(
+              'YDB client closed before the transaction could be retried',
+              { cause: error instanceof Error ? error : undefined },
+            );
+          }
       }
     }
   }
   async function runTransaction<T>(
     callback: (tx: YdbTransactionContext<C>) => PromiseLike<T>,
     state: { committed: boolean },
+    mode: YdbTransactionMode,
   ): Promise<T> {
     if (!codecRegistryValidated) {
       validateCodecRegistryCompleteness(context.codecDescriptors, contract);
@@ -567,7 +689,7 @@ export function ydb<C extends Contract<SqlStorage>>(
     const controller = new AbortController();
     let callbackTimer: ReturnType<typeof setTimeout> | undefined;
     try {
-      transaction = await acquired.beginTransaction();
+      transaction = await acquired.beginTransaction({ mode });
       const checkActive = () => {
         if (settled) throw new Error('YDB transaction is already settled');
       };
@@ -617,10 +739,7 @@ export function ydb<C extends Contract<SqlStorage>>(
         },
       };
       scopedRuntime = makeRuntime(scopedDriver);
-      // Pinned Prisma RC internals; a renamed field only repeats validation.
-      (
-        scopedRuntime as unknown as { codecRegistryValidated: boolean }
-      ).codecRegistryValidated = true;
+      markCodecsValidated(scopedRuntime);
       const failMutationScope = () => {
         if (!mutationFailure) {
           mutationFailure = new Error(
@@ -686,7 +805,9 @@ export function ydb<C extends Contract<SqlStorage>>(
           'YDB transaction failed while draining pending operations',
         );
       }
-      if (transaction) {
+      // A statement-level commit already settled the transaction: never replay it.
+      if (transaction?.committed) state.committed = true;
+      else if (transaction) {
         try {
           await transaction.rollback();
         } catch (rollbackError) {

@@ -231,6 +231,16 @@ function model(shape: ModelShape): PslModel {
       ]),
     );
   const managed = tableOptions(shape.table);
+  if (managed.store?.kind === 'column')
+    attributes.push(
+      attr(
+        'model',
+        'columnStore',
+        (['minPartitions', 'maxPartitions'] as const)
+          .filter((key) => managed.store?.[key] !== undefined)
+          .map((key) => named(key, String(managed.store?.[key]))),
+      ),
+    );
   if (managed.partitioning) {
     const settings = managed.partitioning;
     const keys = [

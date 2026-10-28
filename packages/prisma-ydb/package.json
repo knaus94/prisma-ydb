@@ -49,6 +49,7 @@
     "@ydbjs/auth": "6.3.1",
     "@ydbjs/core": "6.3.1",
     "@ydbjs/error": "6.0.6",
+    "@ydbjs/topic": "6.1.4",
     "@ydbjs/value": "6.0.8",
     "tslib": "^2.3.0"
   },
@@ -111,6 +112,17 @@
         ],
         "options": {
           "command": "tsc --build tsconfig.json"
+        }
+      },
+      "test-unit": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "cache": false,
+        "options": {
+          "command": "node scripts/unit.mjs",
+          "cwd": "{workspaceRoot}"
         }
       },
       "test-integration": {

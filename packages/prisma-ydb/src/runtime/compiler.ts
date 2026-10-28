@@ -6,20 +6,23 @@ import type {
 } from '@prisma/orm-family-sql/contract/types';
 import {
   collectOrderedParamRefs,
+  ProjectionItem,
   type AnyExpression,
   type AnyFromSource,
   type AnyParamRef,
   type AnyQueryAst,
+  type ColumnRef,
   type InsertAst,
   type LoweredStatement,
   type OrderByItem,
-  type ProjectionItem,
   type SelectAst,
   type TableSource,
 } from '@prisma/orm-family-sql/relational-core/ast';
 import type { Value } from '@ydbjs/value';
 import { typeToString } from '@ydbjs/value/print';
+import { optionsForTable } from '../control/options.js';
 import { yqlTypeForCodec } from './codecs.js';
+import { keyPathFor } from './keys.js';
 import { ReferentialProgram } from './referential.js';
 import {
   lowerRelationIncludes,
@@ -143,9 +146,15 @@ class YqlCompiler {
   readonly indices;
   private mutationTable: string | undefined;
   private aliasCounter = 0;
+  private keyCounter = 0;
   private reservedIdentifiers: Set<string> | undefined;
   private readonly defaultNamespace: string | undefined;
+  /** Named expressions emitted before the statement (parent key sets). */
+  readonly prelude: string[] = [];
+  private readonly views = new Map<TableSource, string>();
   resultColumns: readonly (readonly [string, string])[] | undefined;
+  /** Column-store emulation of RETURNING: the select list to read back. */
+  private columnReturning: string | undefined;
   constructor(
     private readonly contract: Contract<SqlStorage>,
     private readonly ast: AnyQueryAst,
@@ -194,7 +203,65 @@ class YqlCompiler {
         identifiers.add(alias);
         return alias;
       },
+      keyPath: (source, columns) =>
+        keyPathFor(this.tableDefinition(source), columns),
+      parentKeys: (outer, parents) => this.parentKeys(outer, parents),
+      useView: (source, index) => this.views.set(source, index),
     };
+  }
+  /**
+   * `$__prisma_ydb_keys_N = SELECT DISTINCT <parent keys> FROM (<outer query>)`:
+   * the outer query without its include projections, keeping filters, order
+   * and pagination so the child lookup covers exactly the returned parents.
+   */
+  private parentKeys(
+    outer: SelectAst,
+    parents: readonly ColumnRef[],
+  ): string | undefined {
+    if (outer.groupBy?.length || outer.having || outer.distinctOn?.length)
+      return undefined;
+    // The key set and the outer rows are evaluated separately: an unordered
+    // page could select different parents each time, so only ordered pages qualify.
+    if (
+      (outer.limit !== undefined || outer.offset !== undefined) &&
+      !outer.orderBy?.length
+    )
+      return undefined;
+    const name = `$__prisma_ydb_keys_${++this.keyCounter}`;
+    const aliases = parents.map((_, index) => `__prisma_ydb_key_${index}`);
+    const stripped = outer.withProjection(
+      parents.map((parent, index) => ProjectionItem.of(aliases[index], parent)),
+    );
+    const inner = this.select(stripped);
+    const quoted = aliases.map(quoteYqlIdentifier);
+    const key =
+      quoted.length === 1 ? quoted[0] : `AsTuple(${quoted.join(', ')})`;
+    this.prelude.push(
+      `${name} = SELECT DISTINCT ${key} AS \`k\` FROM (${inner}) AS \`__prisma_ydb_parents\`;`,
+    );
+    return name;
+  }
+  /** Column-oriented tables take the same DML without RETURNING, indexes or changefeeds. */
+  private columnStore(source: TableSource): boolean {
+    const namespaceId = source.namespaceId ?? this.defaultNamespace;
+    const namespace = namespaceId
+      ? this.contract.storage.namespaces[namespaceId]
+      : undefined;
+    return (
+      !!namespace &&
+      optionsForTable(
+        namespace as { entries: Record<string, unknown> },
+        source.name,
+      ).store?.kind === 'column'
+    );
+  }
+  /** `pk` or `AsTuple(pk1, pk2)` for membership tests over the primary key. */
+  private keyTuple(source: TableSource): string {
+    const key = this.tableDefinition(source).primaryKey?.columns ?? [];
+    if (!key.length)
+      throw new TypeError(`YDB table ${source.name} has no primary key`);
+    const quoted = key.map(quoteYqlIdentifier);
+    return quoted.length === 1 ? quoted[0] : `AsTuple(${quoted.join(', ')})`;
   }
   table(source: TableSource): string {
     const namespaceId = source.namespaceId ?? this.defaultNamespace;
@@ -220,11 +287,14 @@ class YqlCompiler {
   }
   source(source: AnyFromSource): string {
     switch (source.kind) {
-      case 'table-source':
+      case 'table-source': {
+        const view = this.views.get(source);
         return (
           this.table(source) +
+          (view ? ` VIEW ${quoteYqlIdentifier(view)}` : '') +
           (source.alias ? ` AS ${quoteYqlIdentifier(source.alias)}` : '')
         );
+      }
       case 'derived-table-source':
         return `(${this.select(source.query)}) AS ${quoteYqlIdentifier(source.alias)}`;
       case 'function-source':
@@ -380,19 +450,47 @@ class YqlCompiler {
     if (ast.offset !== undefined) sql += ` OFFSET ${limit(ast.offset)}`;
     return sql;
   }
-  returning(items: readonly ProjectionItem[] | undefined): string {
-    if (!items?.length) return ' RETURNING *'; // exact affected count, never physical write statistics
-    const columns: [string, string][] = items.map((item) => {
-      if (item.expr.kind !== 'column-ref')
-        return unsupported('computed mutation RETURNING projections');
-      return [item.alias, item.expr.column];
+  returning(
+    items: readonly ProjectionItem[] | undefined,
+    columnStore = false,
+  ): string {
+    let list = '*'; // exact affected count, never physical write statistics
+    if (items?.length) {
+      const columns: [string, string][] = items.map((item) => {
+        if (item.expr.kind !== 'column-ref')
+          return unsupported('computed mutation RETURNING projections');
+        return [item.alias, item.expr.column];
+      });
+      this.resultColumns = columns;
+      list = [
+        ...new Set(columns.map(([, column]) => quoteYqlIdentifier(column))),
+      ].join(', ');
+    }
+    if (!columnStore) return ` RETURNING ${list}`;
+    // Column tables reject RETURNING; the program reads the rows back by key.
+    this.columnReturning = list;
+    return '';
+  }
+  /** Read inserted column-store rows back through their explicit key values. */
+  private insertedRows(ast: InsertAst): string {
+    const key = this.tableDefinition(ast.table).primaryKey?.columns ?? [];
+    const tuples = ast.rows.map((row) => {
+      const parts = key.map((column) => {
+        const value = row[column];
+        if (!value || value.kind === 'default-value')
+          return unsupported(
+            'column-store INSERT without explicit primary key values',
+          );
+        return this.expr(value);
+      });
+      return parts.length === 1 ? parts[0] : `AsTuple(${parts.join(', ')})`;
     });
-    this.resultColumns = columns;
-    return ` RETURNING ${[...new Set(columns.map(([, column]) => quoteYqlIdentifier(column)))].join(', ')}`;
+    return `SELECT ${this.columnReturning} FROM ${this.table(ast.table)} WHERE ${this.keyTuple(ast.table)} IN AsList(${tuples.join(', ')})`;
   }
   insert(ast: InsertAst, program?: ReferentialProgram): string {
     if (!ast.rows.length) return unsupported('an empty INSERT');
     if (ast.onConflict) return this.upsert(ast, program);
+    const columnStore = this.columnStore(ast.table);
     const columns = [...new Set(ast.rows.flatMap((row) => Object.keys(row)))];
     if (!columns.length)
       return unsupported(
@@ -453,7 +551,8 @@ class YqlCompiler {
           .join(' UNION ALL '),
       );
     }
-    return `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) VALUES ${rows}${this.returning(ast.returning)}`;
+    const statement = `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) VALUES ${rows}${this.returning(ast.returning, columnStore)}`;
+    return columnStore ? `${statement};\n${this.insertedRows(ast)}` : statement;
   }
   upsert(ast: InsertAst, program?: ReferentialProgram): string {
     const conflict = ast.onConflict;
@@ -465,6 +564,7 @@ class YqlCompiler {
     if (ast.rows.length !== 1)
       return unsupported('bulk UPSERT with different create/update branches');
     const table = this.tableDefinition(ast.table);
+    const columnStore = this.columnStore(ast.table);
     const key = table.primaryKey?.columns ?? [];
     const targets = conflict.columns.map((column) => column.column);
     if (
@@ -507,7 +607,11 @@ class YqlCompiler {
       )
         return unsupported('UPSERT SKIP with implicit foreign key defaults');
       program?.checkParents(ast.table, candidates);
-      return `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) ${candidates}${this.returning(ast.returning)}`;
+      const statement = `INSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) ${candidates}${this.returning(ast.returning, columnStore)}`;
+      if (!columnStore) return statement;
+      // Only a row absent beforehand counts as inserted.
+      const before = '$__prisma_ydb_before';
+      return `${before} = SELECT ${this.keyTuple(ast.table)} AS \`k\` FROM ${this.table(ast.table)} WHERE ${where};\n${statement};\nSELECT ${this.columnReturning} FROM ${this.table(ast.table)} WHERE ${where} AND NOT EXISTS(SELECT * FROM ${before})`;
     }
     const existing = '$__prisma_ydb_existing';
     const columns = Object.keys(table.columns);
@@ -539,6 +643,10 @@ class YqlCompiler {
       return `${definition.nullable ? expression : `Unwrap(${expression})`} AS ${quoteYqlIdentifier(column)}`;
     });
     const capture = `${existing} = SELECT * FROM ${this.table(ast.table)} WHERE ${where};`;
+    // YDB 26.2 column tables: never read a row back in the transaction that
+    // wrote it; the written values are recomputed from the same expressions.
+    if (columnStore)
+      return `${capture}\nUPSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${select.join(', ')}${this.returning(ast.returning, true)};\nSELECT ${this.columnReturning} FROM (SELECT ${select.join(', ')}) AS \`__prisma_ydb_upserted\``;
     if (!program)
       return `${capture}\nUPSERT INTO ${this.table(ast.table)} (${columns.map(quoteYqlIdentifier).join(', ')}) SELECT ${select.join(', ')}${this.returning(ast.returning)}`;
     program.statements.push(capture);
@@ -557,6 +665,7 @@ class YqlCompiler {
         .map((part) => (typeof part === 'string' ? part : this.expr(part)))
         .join('');
     this.mutationTable = ast.table.alias ?? ast.table.name;
+    const columnStore = this.columnStore(ast.table);
     const program = ReferentialProgram.applies(this.contract, ast.table)
       ? new ReferentialProgram(
           this.contract,
@@ -564,11 +673,40 @@ class YqlCompiler {
           quoteYqlIdentifier,
         )
       : undefined;
+    if (program && columnStore)
+      return unsupported('referential actions on column-store tables');
     if (ast.kind === 'insert') {
       const statement = this.insert(ast, program);
       return program?.render(statement) ?? statement;
     }
     const where = ast.where ? ` WHERE ${this.expr(ast.where)}` : '';
+    if (columnStore) {
+      // YDB 26.2 column tables: a row read after its own update in one
+      // transaction loses later deletes, so the affected rows are captured
+      // before the write and never read back from the table afterwards.
+      const table = this.table(ast.table);
+      const rows = '$__prisma_ydb_rows';
+      this.returning(ast.returning, true);
+      if (ast.kind === 'update') {
+        if (!Object.keys(ast.set).length) return unsupported('an empty UPDATE');
+        const assignments = Object.entries(ast.set)
+          .map(
+            ([column, value]) =>
+              `${quoteYqlIdentifier(column)} = ${this.expr(value)}`,
+          )
+          .join(', ');
+        // The updated values are the assignment expressions applied to the snapshot.
+        const projected = Object.keys(this.tableDefinition(ast.table).columns)
+          .map((column) =>
+            ast.set[column]
+              ? `${this.expr(ast.set[column])} AS ${quoteYqlIdentifier(column)}`
+              : quoteYqlIdentifier(column),
+          )
+          .join(', ');
+        return `${rows} = SELECT * FROM ${table}${where};\nUPDATE ${table} SET ${assignments}${where};\nSELECT ${this.columnReturning} FROM (SELECT ${projected} FROM ${rows}) AS \`__prisma_ydb_updated\``;
+      }
+      return `${rows} = SELECT * FROM ${table}${where};\nDELETE FROM ${table}${where};\nSELECT ${this.columnReturning} FROM ${rows}`;
+    }
     const original = program
       ? `SELECT * FROM ${this.table(ast.table)}${where}`
       : '';
@@ -657,6 +795,7 @@ export function compileYql(
     sql: [
       ...headers,
       ...types.map((type, index) => `DECLARE $p${index + 1} AS ${type};`),
+      ...compiler.prelude,
       body,
     ].join('\n'),
     params: compiler.refs.map((ref) =>

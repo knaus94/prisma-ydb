@@ -1,5 +1,9 @@
 export interface Scope {
   readonly signal: AbortSignal;
+  /** Abort this scope locally, for example when a consumer stops a stream early. */
+  abort(reason?: unknown): void;
+  /** Link one more parent after construction; the link is removed by dispose(). */
+  follow(parent: AbortSignal | undefined): void;
   dispose(): void;
 }
 
@@ -12,15 +16,17 @@ export function deadline(
     throw new TypeError('YDB timeoutMs must be positive');
   const controller = new AbortController();
   const listeners: (() => void)[] = [];
-  for (const parent of parents) {
-    if (!parent) continue;
-    const abort = () => controller.abort(parent.reason);
-    if (parent.aborted) abort();
-    else {
-      parent.addEventListener('abort', abort, { once: true });
-      listeners.push(() => parent.removeEventListener('abort', abort));
+  const follow = (parent: AbortSignal | undefined): void => {
+    if (!parent || controller.signal.aborted) return;
+    if (parent.aborted) {
+      controller.abort(parent.reason);
+      return;
     }
-  }
+    const abort = () => controller.abort(parent.reason);
+    parent.addEventListener('abort', abort, { once: true });
+    listeners.push(() => parent.removeEventListener('abort', abort));
+  };
+  for (const parent of parents) follow(parent);
   const timer =
     timeoutMs === undefined
       ? undefined
@@ -31,9 +37,12 @@ export function deadline(
   timer?.unref();
   return {
     signal: controller.signal,
+    abort: (reason) => controller.abort(reason),
+    follow,
     dispose() {
       clearTimeout(timer);
       for (const remove of listeners) remove();
+      listeners.length = 0;
     },
   };
 }

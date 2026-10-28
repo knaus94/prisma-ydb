@@ -157,7 +157,9 @@ export class YdbContractSerializer extends SqlContractSerializerBase<
 
 /** Fail before applying DDL for features YDB cannot enforce. */
 export function validateYdbContract(contract: Contract<SqlStorage>): void {
-  for (const namespace of Object.values(contract.storage.namespaces)) {
+  for (const [namespaceId, namespace] of Object.entries(
+    contract.storage.namespaces,
+  )) {
     for (const [name, table] of Object.entries(namespace.entries.table ?? {})) {
       if (YDB_CONTROL_TABLES.has(name))
         throw new Error(
@@ -166,6 +168,40 @@ export function validateYdbContract(contract: Contract<SqlStorage>): void {
       if (!table.primaryKey || table.primaryKey.columns.length === 0)
         throw new Error(`YDB table ${name} requires a primary key.`);
       const managed = optionsForTable(namespace, name);
+      if (managed.store?.kind === 'column') {
+        const unsupported = [
+          managed.partitioning && 'row-table @@partitioning',
+          managed.changefeeds?.length && '@@changefeed',
+          ydbTtlEntries(namespace)[name] && '@@ttl',
+          table.indexes.length && '@@index',
+          table.uniques.length && '@@unique',
+          Object.values(table.columns).some(
+            (column) => column.codecId === 'ydb/uuid@1',
+          ) && 'Uuid columns',
+          table.foreignKeys.some(
+            (key) => key.onDelete !== undefined || key.onUpdate !== undefined,
+          ) && 'relation actions',
+        ].filter((item): item is string => typeof item === 'string');
+        if (unsupported.length)
+          throw new Error(
+            `YDB column-store table ${name} does not support ${unsupported.join(', ')}.`,
+          );
+      }
+      for (const key of table.foreignKeys) {
+        if (key.onDelete === undefined && key.onUpdate === undefined) continue;
+        const target =
+          contract.storage.namespaces[key.target.namespaceId || namespaceId]
+            ?.entries.table?.[key.target.tableName];
+        const targetOptions = optionsForTable(
+          contract.storage.namespaces[key.target.namespaceId || namespaceId] ??
+            namespace,
+          key.target.tableName,
+        );
+        if (target && targetOptions.store?.kind === 'column')
+          throw new Error(
+            `YDB relation actions cannot reference column-store table ${key.target.tableName} (${name}); row and column tables never share a write transaction.`,
+          );
+      }
       if (
         managed.partitioning?.uniformPartitions !== undefined ||
         managed.changefeeds?.some((feed) => feed.partitions !== undefined)

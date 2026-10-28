@@ -8,7 +8,7 @@ import {
   modelAttribute,
 } from '@prisma/orm-framework/psl-parser';
 import type { AuthoringModelAttributeContext } from '@prisma/orm-framework/components/authoring';
-import { partitioning, changefeed } from './options.js';
+import { partitioning, changefeed, store } from './options.js';
 
 function invalid(
   context: AuthoringModelAttributeContext,
@@ -22,6 +22,45 @@ function invalid(
   return undefined;
 }
 export const ydbModelAttributes = {
+  columnStore: {
+    kind: 'modelAttribute' as const,
+    attribute: 'columnStore',
+    spec: () =>
+      modelAttribute('columnStore', {
+        documentation:
+          'Column-oriented (OLAP) table hash-partitioned by its primary key; partition counts are creation-only.',
+        named: {
+          minPartitions: {
+            type: optional(int({ min: 1 })),
+            documentation: 'Initial minimum partitions.',
+          },
+          maxPartitions: {
+            type: optional(int({ min: 1 })),
+            documentation: 'Maximum partitions.',
+          },
+        },
+      }),
+    lower(
+      parsed: Record<string, unknown>,
+      context: AuthoringModelAttributeContext,
+    ) {
+      try {
+        return {
+          key: context.storageName,
+          entity: {
+            table: context.storageName,
+            ...store(
+              Object.fromEntries(
+                Object.entries(parsed).filter(([, v]) => v !== undefined),
+              ),
+            ),
+          },
+        };
+      } catch (error) {
+        return invalid(context, error);
+      }
+    },
+  },
   partitioning: {
     kind: 'modelAttribute' as const,
     attribute: 'partitioning',

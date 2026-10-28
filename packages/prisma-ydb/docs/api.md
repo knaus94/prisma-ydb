@@ -243,6 +243,9 @@ invalidates that transaction, including when the callback catches its exception:
 part of a parent/child write cannot then be committed. Without an outer callback,
 Prisma's mutation executor opens and settles a native transaction for the graph.
 
+Ordinary ORM calls compile their YQL text on every invocation; the driver only
+caches the parsed statement metadata. For hot paths that repeat one query shape
+with different values, prepare the query once.
 `db.prepare(declaration, callback)` uses Prisma's prepared plan API: compilation
 and result-decoder setup are reused, while each call binds and validates values.
 Pass the client directly to the prepared handle: `await prepared.query(db, params)`.
@@ -291,11 +294,58 @@ are unknown. Raw reads can run through `query()`.
 The same bounds apply to `updateAndCount`/`deleteAndCount`, which count returned
 rows. Split large mutations into bounded batches when necessary.
 
+## Streaming, bulk writes and changefeeds
+
+`db.streaming` exposes the same `orm`, `sql` and `raw` lanes bound to a driver
+that yields rows as the server streams them, without the `maxResultRows` and
+`maxResultBytes` bounds:
+
+```ts
+for await (const task of db.streaming.orm.Task.where({ done: false }).all()) {
+  await exportRow(task);
+}
+```
+
+Consume the iterator completely. Leaving it early (`break`, `first()`, an
+exception) cancels the RPC, so the session's outcome is unknown and it is
+discarded instead of returned to the pool. Retries stop once the first row has
+been delivered. Streaming is not available inside `db.transaction`.
+
+`db.bulkUpsert(model, rows, { chunkSize, timeoutMs, signal })` encodes model rows
+through the contract codecs and writes them with TableService `BulkUpsert`: an
+idempotent, chunked (default 1000 rows), retried upload that runs outside any
+transaction and is far cheaper than `UPSERT` statements for large loads. Every
+row must carry the full primary key. The upload touches only the fields it
+carries: a field absent from every row is left untouched, a field present in some
+rows is written as `NULL` for the others (nullable fields only). Column tables
+require every column per row, so their uploads always carry the full row. Like
+raw YQL, it bypasses `temporal.*` presets and client-side referential actions.
+
+`db.changefeed(model, { consumer, feed?, limit?, waitMs?, partitionIds?, readFrom?, maxLagMs?, signal? })`
+reads a managed `@@changefeed` topic (`format: Json`) and yields batches of
+decoded events:
+
+```ts
+for await (const batch of db.changefeed('Order', { consumer: 'app' })) {
+  for (const event of batch.events) {
+    // event.kind: 'update' | 'erase'; event.key, event.newImage, event.oldImage, event.updates
+  }
+  await batch.commit();
+}
+```
+
+Values are decoded with the model's codecs (BigInt as `bigint`, Decimal as a
+string, lists as arrays); unmapped columns are ignored and `event.raw` keeps the
+server record. `feed` is required when the model declares several changefeeds,
+and the consumer must exist on the topic (declare it in `consumers`). The
+iterator ends when `signal` aborts or the client closes; uncommitted batches are
+delivered again to the next reader of that consumer.
+
 ## Type mapping
 
 | Contract scalar | YDB storage     | JavaScript                                 |
 | --------------- | --------------- | ------------------------------------------ |
-| `Uuid`          | `Uuid`          | canonical lowercase UUID `string`           |
+| `Uuid`          | `Uuid`          | canonical lowercase UUID `string`          |
 | `String`        | `Utf8`          | `string`                                   |
 | `Int`           | `Int32`         | checked integer `number`                   |
 | `BigInt`        | `Int64`         | range-checked `bigint`                     |

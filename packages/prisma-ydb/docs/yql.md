@@ -125,7 +125,7 @@ by default.
 
 | Type            | ORM                                                  | Decoded native YQL    |
 | --------------- | ---------------------------------------------------- | --------------------- |
-| Uuid            | canonical lowercase UUID `string`                    | UUID `string`        |
+| Uuid            | canonical lowercase UUID `string`                    | UUID `string`         |
 | Utf8            | `string`                                             | `string`              |
 | Bool            | `boolean`                                            | `boolean`             |
 | Int32           | `number`                                             | `number`              |

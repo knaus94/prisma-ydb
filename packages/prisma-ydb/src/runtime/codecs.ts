@@ -103,6 +103,13 @@ export class YdbCodecDescriptor<
   factory() {
     return () => new YdbCodec(this, this.conversion);
   }
+  /** Synchronous wire encoding for paths outside Prisma's codec pipeline (bulk writes). */
+  wire(value: unknown): Value {
+    return this.conversion.wire(this.conversion.read(value));
+  }
+  fromJson(value: JsonValue): T {
+    return this.conversion.fromJson(value);
+  }
 }
 
 function assertString(value: unknown): string {
@@ -579,6 +586,42 @@ export function yqlTypeForCodec(codecId: string, typeParams?: unknown): string {
   const codec = codecsById.get(codecId);
   if (!codec) throw new TypeError(`YDB codec not registered: ${codecId}`);
   return codec.yqlType;
+}
+
+/** Encode one JavaScript value as a typed YDB value through the column's codec. */
+export function encodeYdbValue(
+  codecId: string,
+  value: unknown,
+  typeParams?: unknown,
+): Value {
+  if (codecId === ydbDecimal.codecId) {
+    const { precision, scale } = decimalParams(typeParams);
+    return new DecimalValue(
+      decimalText(value, precision, scale),
+      precision,
+      scale,
+    );
+  }
+  const codec = codecsById.get(codecId);
+  if (!codec || !(codec instanceof YdbCodecDescriptor))
+    throw new TypeError(`YDB codec not registered: ${codecId}`);
+  return codec.wire(value);
+}
+
+/** Decode the codec's JSON form (the form ORM list columns and changefeeds carry). */
+export function decodeYdbJson(
+  codecId: string,
+  value: JsonValue,
+  typeParams?: unknown,
+): unknown {
+  if (codecId === ydbDecimal.codecId) {
+    const { precision, scale } = decimalParams(typeParams);
+    return decimalText(value, precision, scale);
+  }
+  const codec = codecsById.get(codecId);
+  if (!codec || !(codec instanceof YdbCodecDescriptor))
+    throw new TypeError(`YDB codec not registered: ${codecId}`);
+  return codec.fromJson(value);
 }
 
 export function encodeYdbJson(

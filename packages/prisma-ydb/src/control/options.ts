@@ -24,9 +24,17 @@ export interface YdbChangefeed {
   autoPartitioning: boolean;
   consumers: string[];
 }
+/** Column-oriented (OLAP) storage; hash-partitioned by the primary key at creation. */
+export interface YdbStore {
+  kind: 'column';
+  /** Creation-only: column tables cannot alter their partition counts later. */
+  minPartitions?: number;
+  maxPartitions?: number;
+}
 export interface YdbTableOptions {
   partitioning?: YdbPartitioning;
   changefeeds?: YdbChangefeed[];
+  store?: YdbStore;
 }
 const modes: Record<string, string> = {
   KeysOnly: 'KEYS_ONLY',
@@ -101,6 +109,25 @@ export function partitioning(value: unknown): YdbPartitioning {
     (result.uniformPartitions ?? 1) > result.maxPartitions
   )
     throw new Error('uniformPartitions exceeds maxPartitions.');
+  return result;
+}
+export function store(value: unknown): YdbStore {
+  const input = record(value);
+  const result: YdbStore = { kind: 'column' };
+  for (const key of Object.keys(input)) {
+    if (key === 'kind') {
+      if (input[key] !== 'column')
+        throw new Error('Unsupported YDB store kind: ' + String(input[key]));
+    } else if (key === 'minPartitions' || key === 'maxPartitions')
+      result[key] = positive(input[key], key);
+    else throw new Error('Unknown YDB store setting: ' + key);
+  }
+  if (
+    result.minPartitions !== undefined &&
+    result.maxPartitions !== undefined &&
+    result.minPartitions > result.maxPartitions
+  )
+    throw new Error('minPartitions exceeds maxPartitions.');
   return result;
 }
 export function changefeed(value: unknown): YdbChangefeed {
@@ -184,9 +211,10 @@ function canonicalOptions(value: unknown): YdbTableOptions {
   )
     throw new Error('Duplicate changefeed name');
   for (const key of Object.keys(raw))
-    if (!['partitioning', 'changefeeds'].includes(key))
+    if (!['partitioning', 'changefeeds', 'store'].includes(key))
       throw new Error('Unknown YDB table annotation: ' + key);
   return {
+    ...(raw.store ? { store: store(raw.store) } : {}),
     ...(raw.partitioning
       ? { partitioning: partitioning(raw.partitioning) }
       : {}),
@@ -209,6 +237,7 @@ function frozen<T>(value: T): T {
 function storedOptions(options: YdbTableOptions): Record<string, unknown> {
   const flag = (value: boolean) => (value ? 'ENABLED' : 'DISABLED');
   return {
+    ...(options.store ? { store: options.store } : {}),
     ...(options.partitioning
       ? {
           partitioning: {
@@ -266,6 +295,7 @@ export function normalizeYdbOptions(
   for (const table of Object.keys(entries.table ?? {})) {
     const raw = optionsForTable({ entries }, table);
     byTable.set(table, {
+      ...(raw.store ? { store: store(raw.store) } : {}),
       ...(raw.partitioning
         ? { partitioning: partitioning(raw.partitioning) }
         : {}),
@@ -290,6 +320,17 @@ export function normalizeYdbOptions(
       throw new Error('Duplicate partitioning for ' + table);
     options.partitioning = partitioning(settings);
   }
+  for (const value of Object.values(entries['columnStore'] ?? {})) {
+    const row = record(value),
+      table = String(row.table),
+      options = byTable.get(table);
+    if (!options)
+      throw new Error('Column store refers to missing table ' + table);
+    const settings = { ...row };
+    delete settings.table;
+    if (options.store) throw new Error('Duplicate store for ' + table);
+    options.store = store(settings);
+  }
   for (const value of Object.values(entries['changefeed'] ?? {})) {
     const row = record(value),
       table = String(row.table),
@@ -307,10 +348,12 @@ export function normalizeYdbOptions(
   }
   delete entries['partitioning'];
   delete entries['changefeed'];
+  delete entries['columnStore'];
   entries['ydb_options'] = Object.fromEntries(
     [...byTable]
       .filter(
-        ([, options]) => options.partitioning || options.changefeeds?.length,
+        ([, options]) =>
+          options.partitioning || options.changefeeds?.length || options.store,
       )
       .map(([table, options]) => [
         table,
@@ -387,6 +430,9 @@ export function matchesOptions(
   actual: YdbTableOptions,
   expected: YdbTableOptions,
 ): boolean {
+  // Partition counts of column tables are creation-only and not reported back.
+  if ((actual.store?.kind ?? 'row') !== (expected.store?.kind ?? 'row'))
+    return false;
   if (expected.partitioning)
     for (const [key, value] of Object.entries(expected.partitioning)) {
       if (key === 'uniformPartitions') {
@@ -433,6 +479,12 @@ export async function readTableOptions(
     await import('@ydbjs/api/table');
   const { StatusIds_StatusCode } = await import('@ydbjs/api/operation');
   const { anyUnpack } = await import('@bufbuild/protobuf/wkt');
+  const { StoreType } = await import('@ydbjs/api/table');
+  if (table.storeType === StoreType.COLUMN) {
+    if (table.changefeeds.length)
+      throw new Error('YDB column table ' + path + ' reports changefeeds.');
+    return { store: { kind: 'column' } };
+  }
   const settings = table.partitioningSettings;
   const partition: YdbPartitioning = {
     ...(settings?.partitioningBySize

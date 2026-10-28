@@ -1,9 +1,12 @@
 import { retryDefaults } from './retry.js';
 import type { YdbDriverOptions, YdbRetryOptions } from './types.js';
 
-export type Options = Required<Omit<YdbDriverOptions, 'onEvent' | 'retry'>> &
+export type Options = Required<
+  Omit<YdbDriverOptions, 'onEvent' | 'retry' | 'maxTransactionSessions'>
+> &
   Pick<YdbDriverOptions, 'onEvent'> & {
     readonly retry: false | Required<YdbRetryOptions>;
+    readonly maxTransactionSessions: number;
   };
 
 const defaults = {
@@ -22,7 +25,10 @@ const defaults = {
   includeServerIssues: false,
   readTransactionMode: 'snapshotReadOnly',
   statsMode: 'none',
-} as const satisfies Omit<Options, 'onEvent' | 'retry'>;
+} as const satisfies Omit<
+  Options,
+  'onEvent' | 'retry' | 'maxTransactionSessions'
+>;
 
 const enumerations = {
   readTransactionMode: ['snapshotReadOnly', 'serializable'],
@@ -58,7 +64,12 @@ export function resolveOptions(input: YdbDriverOptions = {}): Options {
     Object.entries(input).filter(([, value]) => value !== undefined),
   );
   for (const key of Object.keys(provided))
-    if (!Object.hasOwn(defaults, key) && key !== 'onEvent' && key !== 'retry')
+    if (
+      !Object.hasOwn(defaults, key) &&
+      key !== 'onEvent' &&
+      key !== 'retry' &&
+      key !== 'maxTransactionSessions'
+    )
       throw new TypeError(`Unknown YDB option ${key}`);
   const result = {
     ...defaults,
@@ -81,5 +92,11 @@ export function resolveOptions(input: YdbDriverOptions = {}): Options {
     throw new TypeError('YDB onEvent must be a function');
   if (result.minSessions > result.maxSessions)
     throw new TypeError('YDB minSessions must not exceed maxSessions');
-  return result;
+  const held = input.maxTransactionSessions ?? result.maxSessions;
+  integer('maxTransactionSessions', held, 1);
+  if (held > result.maxSessions)
+    throw new TypeError(
+      'YDB maxTransactionSessions must not exceed maxSessions',
+    );
+  return { ...result, maxTransactionSessions: held };
 }

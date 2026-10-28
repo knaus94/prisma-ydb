@@ -12,6 +12,12 @@ export interface YdbBinding {
 export interface YdbDriverOptions {
   readonly maxSessions?: number;
   readonly minSessions?: number;
+  /**
+   * Cap on sessions held through acquireConnection(): interactive transactions,
+   * Prisma mutation graphs and explicit connections. Defaults to maxSessions;
+   * a lower value keeps the remainder free for driver-owned autocommit statements.
+   */
+  readonly maxTransactionSessions?: number;
   readonly sessionMaxIdleMs?: number;
   readonly sessionMaxAgeMs?: number;
   readonly sessionCloseTimeoutMs?: number;
@@ -41,7 +47,8 @@ export interface YdbDriverEvent {
     | 'commit'
     | 'rollback'
     | 'destroy'
-    | 'retry';
+    | 'retry'
+    | 'bulk-upsert';
   readonly pool: YdbPoolStats;
   readonly attempt?: number;
   readonly durationMs: number;
@@ -72,11 +79,35 @@ export interface YdbQueryRequest {
   readonly valueMode?: 'decoded' | 'wire';
   /** Count RETURNING rows. Native YDB execution stats also count index writes. */
   readonly affectedRows?: 'returning';
+  /**
+   * Inside an interactive transaction: commit together with this statement,
+   * saving the separate CommitTransaction round trip. The transaction accepts
+   * no further statements; a later commit() is a no-op and rollback() fails.
+   */
+  readonly commit?: boolean;
 }
 
 export interface YdbSqlExecuteRequest extends SqlExecuteRequest {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+}
+
+export type YdbTransactionMode = 'serializable' | 'snapshotReadOnly';
+
+export interface YdbBeginTransactionOptions {
+  /** Snapshot read-only transactions never conflict with writers; writes in them are rejected by the server. */
+  readonly mode?: YdbTransactionMode;
+}
+
+export interface YdbBulkUpsertRequest {
+  /** Database-relative table path. */
+  readonly table: string;
+  /** A List<Struct<...>> value; every struct carries the full primary key. */
+  readonly rows: YdbParameter;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
+  /** BulkUpsert is idempotent; `false` disables the driver's bounded retries. */
+  readonly retry?: boolean;
 }
 
 export interface YdbQueryPart {
@@ -110,6 +141,8 @@ export interface YdbPoolStats {
   readonly maxSessions: number;
   readonly idle: number;
   readonly leased: number;
+  /** Leases obtained through acquireConnection(), bounded by maxTransactionSessions. */
+  readonly held: number;
   readonly creating: number;
   readonly waiters: number;
   readonly closing: number;

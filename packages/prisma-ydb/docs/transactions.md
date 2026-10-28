@@ -20,8 +20,45 @@ await db.transaction(
 ```
 
 Use `tx` inside the callback. A query through the root `db` runs separately and
-will not roll back with this transaction. Await the operations you start and do
+will not roll back with this transaction.
+
+`{ mode: 'snapshotReadOnly' }` opens a snapshot read-only transaction instead:
+every read in the callback sees one consistent snapshot, it never conflicts with
+concurrent writers (so it is never aborted by them), and the server rejects any
+write issued through it. Use it for multi-statement reports and consistency checks. Await the operations you start and do
 not retain the transaction handle after the callback settles.
+
+## Round trips
+
+The server transaction begins with the callback's first statement (`beginTx` in
+its transaction control), not with a separate BeginTransaction RPC, and the
+driver commits with one CommitTransaction RPC after the callback returns. A
+callback of N statements therefore costs N + 1 round trips; a callback that
+issues no statements costs none. Rollback of a transaction that never reached
+the server is also local.
+
+A native statement can carry the commit itself. Set `commit: true` on the last
+`tx.queryYql` request to fold the commit into that round trip:
+
+```ts
+import { Text } from 'prisma-ydb/runtime';
+
+await db.transaction(async (tx) => {
+  const [project] = await tx.orm.Project.where({ id }).select('name');
+  await tx.queryYql({
+    text: 'DECLARE $id AS Utf8; UPDATE `Project` SET archived = TRUE WHERE id = $id',
+    parameters: { id: new Text(id) },
+    commit: true,
+  });
+  return project;
+});
+```
+
+After a statement-level commit, the transaction accepts no further statements:
+the callback's own commit becomes a no-op, more queries through `tx` fail, and a
+callback exception no longer rolls anything back or triggers a retry. A failed
+`commit: true` statement with an uncertain status is `outcomeUnknown`, exactly
+like a failed CommitTransaction.
 
 A handle created by `db.prepare(...)` can query this transaction with
 `prepared.query(tx, params)`. Its execution uses the held transaction and the
@@ -48,6 +85,10 @@ from `driverOptions.retry`: `baseDelayMs: 10`, `maxDelayMs: 1000`,
 limit comes from `transaction(..., { retry })`, separately from driver
 `maxAttempts`. If driver retries are disabled, explicitly enabled callback
 retries use the default delays.
+
+The backoff pause between callback attempts holds no session. `db.close()`
+interrupts it: the pending transaction rejects with a connection error instead
+of attempting another replay.
 
 External effects inside a callback can happen more than once. Email delivery,
 external payments and message publication need their own replay-safe protocol.
@@ -115,8 +156,11 @@ graph from committing. Start a new transaction for independent work after such
 a failure.
 
 A callback holds its pool session for its full duration. Avoid long external
-network calls inside it. Enough slow callbacks can occupy the entire pool;
-there is currently no separate reservation for autocommit traffic.
+network calls inside it. `driverOptions.maxTransactionSessions` caps how many
+sessions callbacks, Prisma mutation graphs and explicit connections may hold at
+once (default: `maxSessions`); the remainder stays available to autocommit
+statements, and `db.stats().held` reports the current count. Callbacks beyond the
+cap wait in the acquisition queue like any other lease.
 
 Transactions make your chosen operations atomic. Reference checks and deletion
 rules still belong to the application; see [relations](relations.md).

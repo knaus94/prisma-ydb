@@ -73,7 +73,7 @@ class YdbTableIR extends SqlTableIR {
       !matchesOptions(tableOptions(other), tableOptions(this))
     )
       return (
-        'YDB partitioning/changefeed drift on ' +
+        'YDB store/partitioning/changefeed drift on ' +
         this.name +
         ': expected ' +
         JSON.stringify(tableOptions(this)) +
@@ -130,16 +130,17 @@ export async function listYdbTables(core: Driver): Promise<string[]> {
       throw new Error('YDB returned an invalid ListDirectory result.');
     for (const child of result.children) {
       const path = relative ? `${relative}/${child.name}` : child.name;
-      if (
-        child.type === Entry_Type.COLUMN_TABLE ||
-        child.type === Entry_Type.COLUMN_STORE
-      )
+      if (child.type === Entry_Type.COLUMN_STORE)
         throw new Error(
-          `YDB column-oriented object ${path} cannot be represented by this row-table contract.`,
+          `YDB column store ${path} (a standalone OLAP store) is not supported; use standalone column tables.`,
         );
       if (child.type === Entry_Type.DIRECTORY && !child.name.startsWith('.'))
         await walk(path);
-      if (child.type === Entry_Type.TABLE && !CONTROL_TABLES.has(path))
+      if (
+        (child.type === Entry_Type.TABLE ||
+          child.type === Entry_Type.COLUMN_TABLE) &&
+        !CONTROL_TABLES.has(path)
+      )
         tables.push(path);
     }
   }
@@ -305,10 +306,10 @@ function tableToSchema(
   table: DescribeTableResult,
   options: YdbTableOptions,
 ): SqlTableIR {
-  if (table.temporary || table.storeType === StoreType.COLUMN)
-    throw new Error(
-      `YDB temporary or column-oriented table ${name} is not supported by the row-table migration model.`,
-    );
+  if (table.temporary)
+    throw new Error(`YDB temporary table ${name} is not supported.`);
+  if (table.storeType === StoreType.COLUMN && table.indexes.length)
+    throw new Error(`YDB column table ${name} reports secondary indexes.`);
   if (
     (table.ttlSettings?.mode.case &&
       table.ttlSettings.mode.case !== 'dateTypeColumn') ||

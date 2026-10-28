@@ -34,7 +34,10 @@ YDB_CONNECTION_STRING=grpc://localhost:2137/local YDB_ANONYMOUS_CREDENTIALS=1 ya
 
 Use an empty, disposable database: migration cases refuse pre-existing deployment
 metadata, and each fixture drops its own tables, feeds and migration metadata in
-after hooks. Missing `YDB_CONNECTION_STRING` is an error. CI runs this suite on
+after hooks. After `yarn db:migrate` or `yarn example:run` the local volume holds
+`_prisma_*` tables, so reset it first with `docker compose -f docker/compose.yaml down -v`
+followed by `yarn db:up`. Missing `YDB_CONNECTION_STRING` is an error. Offline
+compiler tests run with `yarn test:unit` (part of `yarn check`) and need no database. CI runs this suite on
 local YDB 26.2.1.14 with two CPU cores and a 3 GB memory limit.
 
 ## Run the example
@@ -66,7 +69,8 @@ the authored source remains `.prisma`.
 
 | Command                                               | Purpose                                                      |
 | ----------------------------------------------------- | ------------------------------------------------------------ |
-| `yarn test:integration`                              | Run the sequential live driver integration suite          |
+| `yarn test:unit`                                      | Run the offline compiler tests                               |
+| `yarn test:integration`                               | Run the sequential live driver integration suite             |
 | `yarn build`                                          | Build ESM and declarations                                   |
 | `yarn lint`, `yarn typecheck`, `yarn check`           | Validate library and consumer                                |
 | `yarn package:pack`                                   | Create an npm tarball in `artifacts/`                        |

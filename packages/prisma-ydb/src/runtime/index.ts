@@ -2,11 +2,19 @@ export { ydb, ydb as default } from './client.js';
 export type {
   YdbClient,
   YdbEnums,
+  YdbModelRows,
   YdbOptions,
   YdbQueryMembers,
   YdbTransactionContext,
   YdbTransactionOptions,
 } from './client.js';
+export type { YdbBulkUpsertOptions, YdbBulkUpsertResult } from './bulk.js';
+export type {
+  YdbChangeBatch,
+  YdbChangeEvent,
+  YdbChangefeedOptions,
+} from './changefeed.js';
+export type { YdbTransactionMode } from '../driver/index.js';
 export {
   YdbCodecDescriptor,
   ydbUtf8,

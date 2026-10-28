@@ -86,11 +86,13 @@ export function normalizeError(
         // 2012 is KIKIMR_CONSTRAINT_VIOLATION, which also covers non-unique
         // constraints. Only this observed native duplicate-key leaf is safe to
         // expose as Prisma's unique violation; PRECONDITION_FAILED alone is not.
+        // Column tables append the conflicting key as JSON after the same leaf text.
         if (
           'issueCode' in issue &&
           issue.issueCode === 2012 &&
           'message' in issue &&
-          issue.message === 'Conflict with existing key.'
+          typeof issue.message === 'string' &&
+          issue.message.startsWith('Conflict with existing key.')
         )
           uniqueViolation = true;
         if ('issues' in issue && Array.isArray(issue.issues))
@@ -122,6 +124,23 @@ export function normalizeError(
       ? error.code
       : undefined;
   return new YdbTransportError(operation, commit, grpcCode);
+}
+
+/** Control-plane RPCs answer with an Operation envelope instead of a bare status. */
+export function checkOperation(
+  operation:
+    | {
+        ready: boolean;
+        status: Status;
+        issues: ConstructorParameters<typeof YDBError>[1];
+      }
+    | undefined,
+): void {
+  if (!operation?.ready || operation.status !== Status.SUCCESS)
+    throw new YDBError(
+      operation?.status ?? Status.STATUS_CODE_UNSPECIFIED,
+      operation?.issues ?? [],
+    );
 }
 
 export function checkStatus(response: {

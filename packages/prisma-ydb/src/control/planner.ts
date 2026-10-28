@@ -6,6 +6,7 @@ import {
   topicConsumerSql,
   type YdbPartitioning,
   type YdbChangefeed,
+  type YdbStore,
 } from './options.js';
 import { APP_SPACE_ID } from '@prisma/orm-framework/components/control';
 import type { Contract } from '@prisma/orm-framework/contract/types';
@@ -38,6 +39,7 @@ import {
 } from './schema.js';
 
 interface TableShape {
+  store?: YdbStore;
   partitioning?: YdbPartitioning;
   changefeeds?: YdbChangefeed[];
   ttl?: YdbTtl;
@@ -103,13 +105,31 @@ export function tableShape(table: SqlTableIR | undefined): unknown {
 
 export function matchesTableShape(actual: unknown, expected: unknown): boolean {
   if (!actual || !expected) return actual === expected;
-  const { partitioning: ap, changefeeds: af, ...a } = actual as TableShape;
-  const { partitioning: ep, changefeeds: ef, ...e } = expected as TableShape;
+  const {
+    partitioning: ap,
+    changefeeds: af,
+    store: as,
+    ...a
+  } = actual as TableShape;
+  const {
+    partitioning: ep,
+    changefeeds: ef,
+    store: es,
+    ...e
+  } = expected as TableShape;
   return (
     stableShape(a) === stableShape(e) &&
     matchesOptions(
-      { ...(ap ? { partitioning: ap } : {}), changefeeds: af ?? [] },
-      { ...(ep ? { partitioning: ep } : {}), changefeeds: ef ?? [] },
+      {
+        ...(as ? { store: as } : {}),
+        ...(ap ? { partitioning: ap } : {}),
+        changefeeds: af ?? [],
+      },
+      {
+        ...(es ? { store: es } : {}),
+        ...(ep ? { partitioning: ep } : {}),
+        changefeeds: ef ?? [],
+      },
     )
   );
 }
@@ -241,6 +261,23 @@ function createTable(table: SqlTableIR): string {
   definitions.push(
     `PRIMARY KEY (${table.primaryKey.columns.map(q).join(', ')})`,
   );
+  const store = tableOptions(table).store;
+  if (store?.kind === 'column') {
+    if (table.indexes.length || table.uniques.length || ydbTableTtl(table))
+      throw new Error(
+        `YDB column-store table ${table.name} cannot declare indexes, unique constraints or TTL.`,
+      );
+    const settings = [
+      'STORE = COLUMN',
+      ...(store.minPartitions !== undefined
+        ? [`AUTO_PARTITIONING_MIN_PARTITIONS_COUNT = ${store.minPartitions}`]
+        : []),
+      ...(store.maxPartitions !== undefined
+        ? [`AUTO_PARTITIONING_MAX_PARTITIONS_COUNT = ${store.maxPartitions}`]
+        : []),
+    ];
+    return `CREATE TABLE ${q(table.name)} (${definitions.join(', ')}) PARTITION BY HASH(${table.primaryKey.columns.map(q).join(', ')}) WITH (${settings.join(', ')})`;
+  }
   for (const index of table.indexes) {
     if (!index.columns?.length)
       throw new Error(`Index ${index.name} requires columns.`);
@@ -497,6 +534,16 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
         }
         if (!before || !after || !desired || !state)
           throw new Error('Invalid YDB schema diff state.');
+        if ((state.store?.kind ?? 'row') !== (desired.store?.kind ?? 'row'))
+          throw new Error(
+            `Changing the storage kind of ${name} between row and column store requires a reviewed table reconstruction; YDB cannot convert it in place.`,
+          );
+        if (state.store && desired.store) {
+          // Partition counts are creation-only; align the checkpoint silently.
+          const next = clone();
+          next.store = desired.store;
+          state = next;
+        }
         if (state.ttl && !desired.ttl) {
           const next = clone();
           delete next.ttl;

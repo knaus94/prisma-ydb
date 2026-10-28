@@ -45,23 +45,24 @@ query limits and retry behavior.
 
 ## Pool and limits
 
-| Option                  | Default            | Meaning                                                    |
-| ----------------------- | ------------------ | ---------------------------------------------------------- |
-| `maxSessions`           | `16`               | Maximum active pool sessions                               |
-| `minSessions`           | `0`                | Best-effort warmup during connect; must not exceed maximum |
-| `maxWaiters`            | `128`              | Admission queue capacity                                   |
-| `acquireTimeoutMs`      | `10000`            | Maximum session wait                                       |
-| `sessionMaxIdleMs`      | `300000`           | Retirement of idle sessions above the warm minimum         |
-| `sessionMaxAgeMs`       | `3600000`          | Retirement of aged sessions                                |
-| `sessionCloseTimeoutMs` | `2000`             | DeleteSession RPC budget                                   |
-| `queryTimeoutMs`        | `30000`            | Query deadline, including retries                          |
-| `transactionTimeoutMs`  | `60000`            | One interactive transaction attempt                        |
-| `closeTimeoutMs`        | `30000`            | Shared runtime/driver shutdown deadline                    |
-| `maxResultRows`         | `100000`           | Result row limit                                           |
-| `maxResultBytes`        | `33554432`         | Estimated result size limit                                |
-| `readTransactionMode`   | `snapshotReadOnly` | Compiler-tagged reads outside interactive transactions     |
-| `statsMode`             | `none`             | Native query statistics; `basic` is opt-in                 |
-| `includeServerIssues`   | `false`            | Include detailed server issues in error causes             |
+| Option                   | Default            | Meaning                                                                     |
+| ------------------------ | ------------------ | --------------------------------------------------------------------------- |
+| `maxSessions`            | `16`               | Maximum active pool sessions                                                |
+| `minSessions`            | `0`                | Best-effort warmup during connect; must not exceed maximum                  |
+| `maxTransactionSessions` | `maxSessions`      | Cap on sessions held across statements (transactions, explicit connections) |
+| `maxWaiters`             | `128`              | Admission queue capacity                                                    |
+| `acquireTimeoutMs`       | `10000`            | Maximum session wait                                                        |
+| `sessionMaxIdleMs`       | `300000`           | Retirement of idle sessions above the warm minimum                          |
+| `sessionMaxAgeMs`        | `3600000`          | Retirement of aged sessions                                                 |
+| `sessionCloseTimeoutMs`  | `2000`             | DeleteSession RPC budget                                                    |
+| `queryTimeoutMs`         | `30000`            | Query deadline, including retries                                           |
+| `transactionTimeoutMs`   | `60000`            | One interactive transaction attempt                                         |
+| `closeTimeoutMs`         | `30000`            | Shared runtime/driver shutdown deadline                                     |
+| `maxResultRows`          | `100000`           | Result row limit                                                            |
+| `maxResultBytes`         | `33554432`         | Estimated result size limit                                                 |
+| `readTransactionMode`    | `snapshotReadOnly` | Compiler-tagged reads outside interactive transactions                      |
+| `statsMode`              | `none`             | Native query statistics; `basic` is opt-in                                  |
+| `includeServerIssues`    | `false`            | Include detailed server issues in error causes                              |
 
 Unknown keys and invalid values are rejected. Size the pool against measured
 latency, database capacity and application concurrency. Each native session has
@@ -101,9 +102,11 @@ invariant. Run `prisma db verify` during deployment for managed schema validatio
 
 ## Metrics and diagnostics
 
-`db.stats()` returns `maxSessions`, `idle`, `leased`, `creating`, `waiters` and
-`closing`. The low-level driver exposes the same snapshot through `driver.stats`.
-`closing` counts background cleanup operations.
+`db.stats()` returns `maxSessions`, `idle`, `leased`, `held`, `creating`,
+`waiters` and `closing`. The low-level driver exposes the same snapshot through
+`driver.stats`. `held` counts leases obtained through `acquireConnection()`
+(interactive transactions and explicit connections); `closing` counts background
+cleanup operations.
 
 ```ts
 const db = ydb<Contract>({
@@ -119,7 +122,10 @@ const db = ydb<Contract>({
 ```
 
 Events cover connect, acquire, session-create, query, begin, commit, rollback,
-destroy and driver retry. Retry events include the next attempt number.
+destroy, bulk-upsert and driver retry. Retry events include the next attempt number. `begin`
+is a local event: the server transaction starts with the first statement.
+`commit` and `rollback` of a transaction without server statements, or after a
+statement-level commit, are local as well.
 Whole-callback retry counting should be instrumented by the application; do not
 assume a driver retry event covers every callback replay.
 

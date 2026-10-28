@@ -137,6 +137,38 @@ this discards retained feed records and offsets, so review consumer recovery fir
 Increasing retention is additive and uses ALTER TOPIC. Removing the partitioning
 attribute stops managing those knobs; it does not reset operational settings.
 
+## Column-store tables
+
+```prisma
+model Event {
+  tenant Int
+  id String
+  kind String
+  at DateTime
+
+  @@id([tenant, id])
+  @@columnStore(minPartitions: 2)
+}
+```
+
+`@@columnStore` creates a column-oriented (OLAP) table, hash-partitioned by its
+primary key; `minPartitions`/`maxPartitions` are creation-only. Column tables on
+YDB 26.2 accept the same ORM reads and mutations as row tables, including
+snapshot and interactive transactions, but reject `@@index`, `@@unique`, `@@ttl`,
+`@@changefeed`, row-table `@@partitioning`, `Uuid` columns and relation actions
+that reference them; contract emission fails with the offending feature. Row and
+column tables never share one write transaction, and mutation `RETURNING` is
+emulated by reading the affected rows back by key inside the same program.
+Changing an existing table between row and column store is refused; perform a
+reviewed reconstruction. Introspection recognizes column tables and prints the
+attribute back.
+
+YDB 26.2 limitation: a column-table row that is read again in the same
+transaction after it was updated loses later deletes. The compiled mutations
+never read a table after writing it (updated and deleted rows are captured
+before the write), but keep that rule for raw YQL and for callbacks that update a
+column table and then query it through `tx` before committing.
+
 ## Manual and data migrations
 
 ### TTL and storage types
