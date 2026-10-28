@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.9
 
 - Fix `prisma-ydb yql generate` for `DISCARD` statements: YDB's EXPLAIN keeps a result binding for a discarded `SELECT` that the client never receives, so generated functions expected an extra result set. Discarded statements are now dropped by source order; scripts whose actions, subqueries or `EVALUATE`/`DO` blocks prevent mapping fail generation instead of guessing.
 
