@@ -10,6 +10,7 @@ export type {
 export {
   YdbCodecDescriptor,
   ydbUtf8,
+  ydbUuid,
   ydbInt32,
   ydbInt64,
   ydbUint64,
@@ -29,6 +30,7 @@ export {
   type CodecTypes,
 } from './codecs.js';
 export { DecimalValue, DecimalType } from './decimal.js';
+export { UuidValue } from '../driver/uuid.js';
 export { TimestampMicrosValue } from './temporal.js';
 export { ydbQueryOperations, type YdbJsonPath } from './operations.js';
 export type QueryOperationTypes<

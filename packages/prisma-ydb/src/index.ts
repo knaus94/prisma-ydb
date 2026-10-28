@@ -11,6 +11,7 @@ export {
   DecimalValue,
   DecimalType,
   TimestampMicrosValue,
+  UuidValue,
 } from './runtime/index.js';
 export { ydbQueryOperations, type YdbJsonPath } from './runtime/operations.js';
 export type { QueryOperationTypes } from './runtime/index.js';

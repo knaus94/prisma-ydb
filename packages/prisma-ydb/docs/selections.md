@@ -96,3 +96,20 @@ statement handle. Parameter declarations follow the pinned Prisma API.
 
 See [NestJS integration](nestjs.md), [relations](relations.md) and the
 [pinned Prisma ORM API](https://github.com/prisma/orm/blob/v8.0.0-rc.18/packages/3-extensions/sql-orm-client/README.md).
+
+For example, a prepared selection can execute on the client or a live transaction:
+
+```ts
+const byId = await db.prepare(
+  { id: 'ydb/utf8@1' } as const,
+  (p) => db.orm.Task.with(select.task).where((row) => row.id.eq(p.id)).prepared.first(),
+);
+const task = await byId.query(db, { id: taskId });
+await db.transaction(async (tx) => {
+  const sameSnapshot = await byId.query(tx, { id: taskId });
+});
+```
+
+Use `'ydb/uuid@1'` when the selected field is authored as `Uuid`. Prepared
+execution uses the target's runtime pipeline; a settled transaction or closed
+client rejects the call. DTO UUID properties stay `string`.

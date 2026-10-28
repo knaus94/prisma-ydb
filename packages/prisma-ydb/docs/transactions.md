@@ -23,6 +23,11 @@ Use `tx` inside the callback. A query through the root `db` runs separately and
 will not roll back with this transaction. Await the operations you start and do
 not retain the transaction handle after the callback settles.
 
+A handle created by `db.prepare(...)` can query this transaction with
+`prepared.query(tx, params)`. Its execution uses the held transaction and the
+same runtime validation and middleware as ordinary ORM queries. Do not retain
+`tx` after settlement; prepared calls reject it as well.
+
 ## Callback retries
 
 Callbacks run once by default. `{ retry: true }` permits five total attempts;

@@ -245,7 +245,11 @@ Prisma's mutation executor opens and settles a native transaction for the graph.
 
 `db.prepare(declaration, callback)` uses Prisma's prepared plan API: compilation
 and result-decoder setup are reused, while each call binds and validates values.
-It does not expose a server-side prepared statement handle or native cache policy.
+Pass the client directly to the prepared handle: `await prepared.query(db, params)`.
+The same handle accepts a live `tx` from `db.transaction`; its queries stay on that
+transaction and reject once it settles. The bridge retains runtime middleware,
+codec validation, cancellation and operation tracking. It does not expose a
+server-side prepared statement handle or native cache policy.
 
 `db.yql(text, parameters)` returns flattened native result rows. Parameters must
 be typed values, for example `new Text('id')`, `new Bool(false)` or `new Int64(1n)`.
@@ -291,6 +295,7 @@ rows. Split large mutations into bounded batches when necessary.
 
 | Contract scalar | YDB storage     | JavaScript                                 |
 | --------------- | --------------- | ------------------------------------------ |
+| `Uuid`          | `Uuid`          | canonical lowercase UUID `string`           |
 | `String`        | `Utf8`          | `string`                                   |
 | `Int`           | `Int32`         | checked integer `number`                   |
 | `BigInt`        | `Int64`         | range-checked `bigint`                     |
@@ -326,6 +331,22 @@ Use exact strings, such as `'1234.50'`, without exponent notation.
 (milliseconds padded to microseconds). Output is canonical, for example
 `2026-10-22T12:34:56.123456Z`. All three temporal codecs accept dates from 1970
 through 2105. Date32 and Timestamp64 are outside this target's schema support.
+
+`Uuid` stores native YDB UUID values, including in composite primary keys and
+synchronous unique indexes. Inputs require the hyphenated hexadecimal shape;
+uppercase hex normalizes to lowercase. UUID versions and variants are not
+restricted, so deterministic operation IDs and nil UUIDs are valid identities.
+UUID generators use `@default(uuid())` or `@default(uuid(7))`. A storage
+literal uses the typed form ``@default(uuid`00112233-4455-6677-8899-aabbccddeeff`)``.
+The existing `Uuid` export remains the SDK primitive with its original input
+semantics; `UuidValue` adds validation and is also exported from the root.
+The UUID codec's `order` trait means YDB's native internal byte ordering, which
+can differ from JavaScript's canonical-string sorting. Use server `ORDER BY` and
+server comparisons together for seek pagination; do not mix a TS string sort
+with a native UUID cursor.
+Use `new UuidValue(value)` for validated native YQL parameters,
+including `Optional`, `List` and `Struct` containers. It keeps the SDK's 128-bit
+representation; money and UUID values never pass through JavaScript numbers.
 
 ## Automatic timestamps
 
@@ -566,7 +587,9 @@ SDK 6.3.1 routes session RPCs with a preferred-node hint. The server session ID
 remains authoritative. Low-level transaction handles are not recreated or
 replayed; whole-callback retries require the explicit option described above.
 Multi-node failover, packet loss, ambiguous commit recovery and
-sustained load have not been validated for this extracted release. This extracted project currently has no automated driver regression suite.
+sustained load have not been validated for this extracted release. The opt-in `yarn test:integration` suite verifies UUID/prepared execution and
+managed partition/changefeed migration lifecycles on an explicitly selected
+disposable database.
 
 ## Official references
 

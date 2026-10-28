@@ -80,14 +80,62 @@ expected before/after table shapes for verification and recovery.
 Automatic primary-key/type reconstruction is refused. Unique indexes can be
 created with a new table; adding one to an existing table is rejected for the
 pinned YDB version. Numeric TTL/tiering, column tables, covering/asynchronous indexes and
-indexes still being built are not silently converted. Partitioning and replica
-settings remain operational configuration outside this schema model.
+indexes still being built are not silently converted. Replica settings remain operational configuration outside this schema model.
+Partitioning and changefeeds are managed by the model attributes below.
 
 Use a dedicated database for the managed contract: final verification also
 checks for unrelated tables. Relations keep their ORM metadata while omitting
 physical FKs. Action-bearing relations retain client-side behavior with no FK DDL. Read
 [relations and referential integrity](relations.md) before defining deletion
 rules or migrating existing references.
+
+## Managed partitioning and changefeeds
+
+```prisma
+model Event {
+  ownerKey Uint64
+  id String
+  payload Json
+
+  @@id([ownerKey, id])
+  @@partitioning(bySize: true, byLoad: true, minPartitions: 16, uniformPartitions: 16)
+  @@changefeed("history", mode: NewImage, format: Json, retention: "P30D", partitions: 16, autoPartitioning: false, consumers: ["history-reader"])
+}
+```
+
+The partition counts above are initial test points, not general tuning recommendations.
+Uniform table partitions and an explicit initial changefeed partition count require a
+Uint32/Uint64-leading primary key on YDB 26.2. `uniformPartitions` is CREATE-only;
+changing it on an existing table requires a reviewed reconstruction. When omitted,
+`minPartitions` defaults to `uniformPartitions` to prevent immediate merging. Only declared partition settings are verified. YDB ALTER may reset undeclared knobs
+to native defaults; declare every knob whose value must be preserved across updates.
+
+`@@changefeed` is repeatable with distinct names. Modes are KeysOnly, Updates,
+NewImage, OldImage and NewAndOldImages; formats are Json and DebeziumJson. Retention
+uses whole days/hours/minutes/seconds, from one second to thirty days. Topic automatic
+partitioning defaults to false. Omitted `partitions` leaves the initial count to YDB;
+a fixed declared count is verified exactly, while enabled automatic partitioning may
+increase it. Consumer names form the complete managed set for each declared feed.
+A table with no changefeed attributes must have no unmanaged feeds.
+
+Attributes normalize into target-owned `entries.ydb_options[table].annotations.ydb`
+in each storage namespace and participate in the storage hash. Stored boolean flags
+use canonical ENABLED/DISABLED strings so family snapshot hashing preserves explicit
+false values; PSL and schema IR expose booleans. They are projected
+into the schema IR without changing Prisma's SQL table SPI. Introspection reads table
+partition settings and each feed's topic partition count, automatic partitioning,
+retention and consumers. Verification fails on managed drift and reports these settings.
+Inference cannot recover the historical uniform-partition creation hint.
+
+Creation plans separate table, feed and consumer DDL statements. Each operation has
+its own before/after checkpoint, including feed presence and consumer registration,
+so retry recognizes DDL that succeeded before its journal acknowledgement was lost.
+Changing table partition knobs or adding a feed/consumer is additive. Shortening feed
+retention, removing consumers or dropping feeds is destructive. Mode, format, initial
+partition-count and automatic-partitioning changes require destructive feed recreation;
+this discards retained feed records and offsets, so review consumer recovery first.
+Increasing retention is additive and uses ALTER TOPIC. Removing the partitioning
+attribute stops managing those knobs; it does not reset operational settings.
 
 ## Manual and data migrations
 

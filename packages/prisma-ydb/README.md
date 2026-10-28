@@ -113,6 +113,21 @@ Unknown commit outcomes require reconciliation. Values travel as parameters.
 | `prisma-ydb/control`     | Migration authoring and control plane             |
 | `prisma-ydb/environment` | SDK environment authentication/TLS                |
 
+## Native UUIDs and prepared reads
+
+Author UUID columns as `Uuid`, nullable UUIDs as `Uuid?`, and keep UUID DTO
+properties as `string`. Native UUID primary keys (including composite keys) and
+synchronous unique indexes retain the 128-bit identity. Inputs accept uppercase
+hex and normalize to lowercase. Native YQL can use validated `new UuidValue(id)` from
+`prisma-ydb/runtime`; optional, list and struct containers preserve that type. The existing `Uuid`
+export keeps the SDK primitive API. Native UUID ordering is YDB byte order, so
+use server ordering and seek comparisons together.
+
+`await db.prepare(declaration, callback)` returns a reusable prepared handle.
+Execute it with `prepared.query(db, params)`, or `prepared.query(tx, params)`
+inside a live `db.transaction` callback. A runtime intermediary is unnecessary.
+See [types and native YQL](docs/yql.md) and [shared selections](docs/selections.md).
+
 ## String enums
 
 Enums declared in `.prisma` generate literal types for writes, filters and query
@@ -141,7 +156,11 @@ Native `temporal.*` presets provide automatic timestamps. Schema types include
 typed nested value objects use Json storage with JSON-path/list filters. See the
 [type and query API](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/api.md).
 Client-side referential actions support Cascade, SetNull and Restrict. Schema TTL
-policies are planned, applied and introspected through the migration workflow.
+policies, `@@partitioning` and `@@changefeed` settings are planned, applied and
+introspected through the migration workflow. Changefeed declarations own topic retention,
+partitioning and consumer names; verification detects drift and migration checkpoints
+cover each table/feed/consumer DDL. Explicit uniform/topic partition counts require an
+unsigned-leading key. See the migration guide for destructive feed recreation rules.
 Raw YQL writes bypass automatic timestamps and referential actions.
 
 Start with the [documentation index](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/README.md). Detailed guides cover
@@ -149,3 +168,12 @@ Start with the [documentation index](https://github.com/knaus94/prisma-ydb/blob/
 [migrations](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/migrations.md), [transactions and retries](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/transactions.md),
 [native YQL](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/yql.md), [selections and DTOs](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/selections.md),
 [NestJS](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/nestjs.md), [operations](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/operations.md) and the [API](https://github.com/knaus94/prisma-ydb/blob/main/packages/prisma-ydb/docs/api.md).
+
+## Integration checks
+
+In the source workspace, `yarn check` validates the library and basic example
+offline. Set `YDB_CONNECTION_STRING` to an empty, disposable local database and
+run `yarn test:integration` for the sequential Node 24 integration suite. The
+fixtures clean up their own tables and feeds; migration fixtures also own and
+remove the control metadata they created. The runner fails when the endpoint
+is missing.

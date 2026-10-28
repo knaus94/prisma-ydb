@@ -1,3 +1,12 @@
+import {
+  tableOptions,
+  matchesOptions,
+  renderPartitioning,
+  addChangefeedSql,
+  topicConsumerSql,
+  type YdbPartitioning,
+  type YdbChangefeed,
+} from './options.js';
 import { APP_SPACE_ID } from '@prisma/orm-framework/components/control';
 import type { Contract } from '@prisma/orm-framework/contract/types';
 import type {
@@ -29,6 +38,8 @@ import {
 } from './schema.js';
 
 interface TableShape {
+  partitioning?: YdbPartitioning;
+  changefeeds?: YdbChangefeed[];
   ttl?: YdbTtl;
   columns: Record<
     string,
@@ -62,6 +73,8 @@ export function tableShape(table: SqlTableIR | undefined): unknown {
   if (!table) return null;
   return {
     ...(ydbTableTtl(table) ? { ttl: ydbTableTtl(table) } : {}),
+    ...tableOptions(table),
+    changefeeds: tableOptions(table).changefeeds ?? [],
     columns: Object.fromEntries(
       Object.entries(table.columns)
         .sort(([a], [b]) => a.localeCompare(b))
@@ -86,6 +99,19 @@ export function tableShape(table: SqlTableIR | undefined): unknown {
       .map((unique) => ({ columns: unique.columns }))
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
   };
+}
+
+export function matchesTableShape(actual: unknown, expected: unknown): boolean {
+  if (!actual || !expected) return actual === expected;
+  const { partitioning: ap, changefeeds: af, ...a } = actual as TableShape;
+  const { partitioning: ep, changefeeds: ef, ...e } = expected as TableShape;
+  return (
+    stableShape(a) === stableShape(e) &&
+    matchesOptions(
+      { ...(ap ? { partitioning: ap } : {}), changefeeds: af ?? [] },
+      { ...(ep ? { partitioning: ep } : {}), changefeeds: ef ?? [] },
+    )
+  );
 }
 
 export interface YdbMigrationOperation {
@@ -227,7 +253,11 @@ function createTable(table: SqlTableIR): string {
       `INDEX ${q(unique.name ?? `${table.name}_unique_${index}`)} GLOBAL UNIQUE SYNC ON (${unique.columns.map(q).join(', ')})`,
     );
   const ttl = ydbTableTtl(table);
-  return `CREATE TABLE ${q(table.name)} (${definitions.join(', ')})${ttl ? ` WITH (TTL = ${renderTtl(ttl)})` : ''}`;
+  const settings = [
+    ...(ttl ? ['TTL = ' + renderTtl(ttl)] : []),
+    ...renderPartitioning(tableOptions(table).partitioning ?? {}, true),
+  ];
+  return `CREATE TABLE ${q(table.name)} (${definitions.join(', ')})${settings.length ? ' WITH (' + settings.join(', ') + ')' : ''}`;
 }
 
 function renderTtl(ttl: YdbTtl): string {
@@ -282,7 +312,11 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
         const after = expected.tables[name];
         const desired = tableShape(after) as TableShape | null;
         let state = tableShape(before) as TableShape | null;
-        if (stableShape(state) === stableShape(desired)) continue;
+        if (
+          stableShape(state) === stableShape(desired) ||
+          matchesTableShape(state, desired)
+        )
+          continue;
         const step = (
           sql: string,
           operationClass: MigrationOperationClass,
@@ -315,8 +349,137 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
         };
         const clone = (): TableShape =>
           JSON.parse(JSON.stringify(state)) as TableShape;
+        const operationalSteps = (): void => {
+          if (!state || !desired) return;
+          const settings = desired.partitioning;
+          if (
+            settings &&
+            stableShape(state.partitioning) !== stableShape(settings)
+          ) {
+            if (
+              before &&
+              settings.uniformPartitions !== undefined &&
+              tableOptions(before).partitioning?.uniformPartitions !==
+                settings.uniformPartitions
+            )
+              throw new Error(
+                'Changing uniformPartitions on existing table ' +
+                  name +
+                  ' requires reviewed reconstruction; it is a CREATE-only directive.',
+              );
+            const sql = renderPartitioning(settings, false);
+            const next = clone();
+            next.partitioning = settings;
+            if (sql.length)
+              step(
+                'ALTER TABLE ' + q(name) + ' SET (' + sql.join(', ') + ')',
+                'additive',
+                next,
+              );
+            else state = next;
+          } else if (!settings && state.partitioning) {
+            const next = clone();
+            delete next.partitioning;
+            state = next;
+          }
+          const wanted = desired.changefeeds ?? [];
+          for (const old of [...(state!.changefeeds ?? [])]) {
+            const replacement = wanted.find((feed) => feed.name === old.name);
+            if (
+              !replacement ||
+              old.mode !== replacement.mode ||
+              old.format !== replacement.format ||
+              old.autoPartitioning !== replacement.autoPartitioning ||
+              (replacement.partitions !== undefined &&
+                old.partitions !== replacement.partitions)
+            ) {
+              const next = clone();
+              next.changefeeds = (next.changefeeds ?? []).filter(
+                (feed) => feed.name !== old.name,
+              );
+              step(
+                'ALTER TABLE ' + q(name) + ' DROP CHANGEFEED ' + q(old.name),
+                'destructive',
+                next,
+              );
+            }
+          }
+          for (const feed of wanted) {
+            let old = state!.changefeeds?.find(
+              (item) => item.name === feed.name,
+            );
+            if (!old) {
+              const next = clone();
+              next.changefeeds ??= [];
+              next.changefeeds.push({ ...feed, consumers: [] });
+              next.changefeeds.sort((a, b) => a.name.localeCompare(b.name));
+              step(addChangefeedSql(name, feed), 'additive', next);
+              old = state!.changefeeds!.find(
+                (item) => item.name === feed.name,
+              )!;
+            }
+            if (old.retentionSeconds !== feed.retentionSeconds) {
+              const next = clone();
+              next.changefeeds!.find(
+                (item) => item.name === feed.name,
+              )!.retentionSeconds = feed.retentionSeconds;
+              step(
+                'ALTER TOPIC ' +
+                  q(name + '/' + feed.name) +
+                  ' SET (RETENTION_PERIOD = Interval(' +
+                  JSON.stringify(ydbDuration(feed.retentionSeconds)) +
+                  '))',
+                feed.retentionSeconds < old.retentionSeconds
+                  ? 'destructive'
+                  : 'additive',
+                next,
+              );
+              old = state!.changefeeds!.find(
+                (item) => item.name === feed.name,
+              )!;
+            }
+            for (const consumer of [...old.consumers])
+              if (!feed.consumers.includes(consumer)) {
+                const next = clone();
+                const entry = next.changefeeds!.find(
+                  (item) => item.name === feed.name,
+                )!;
+                entry.consumers = entry.consumers.filter(
+                  (item) => item !== consumer,
+                );
+                step(
+                  topicConsumerSql(name, feed.name, consumer, false),
+                  'destructive',
+                  next,
+                );
+              }
+            for (const consumer of feed.consumers)
+              if (
+                !state!
+                  .changefeeds!.find((item) => item.name === feed.name)!
+                  .consumers.includes(consumer)
+              ) {
+                const next = clone();
+                next
+                  .changefeeds!.find((item) => item.name === feed.name)!
+                  .consumers.push(consumer);
+                next
+                  .changefeeds!.find((item) => item.name === feed.name)!
+                  .consumers.sort();
+                step(
+                  topicConsumerSql(name, feed.name, consumer, true),
+                  'additive',
+                  next,
+                );
+              }
+          }
+        };
         if (!before && after) {
-          step(createTable(after), 'additive', desired);
+          step(createTable(after), 'additive', {
+            ...desired!,
+            changefeeds: [],
+          });
+          operationalSteps();
           continue;
         }
         if (before && !after) {
@@ -526,7 +689,11 @@ export class YdbMigrationPlanner implements MigrationPlanner<'sql', 'ydb'> {
             next,
           );
         }
-        if (stableShape(state) !== stableShape(desired))
+        operationalSteps();
+        if (
+          stableShape(state) !== stableShape(desired) &&
+          !matchesTableShape(state, desired)
+        )
           throw new Error(
             `Unrecognized schema difference on ${name}; refusing to advance the marker.`,
           );

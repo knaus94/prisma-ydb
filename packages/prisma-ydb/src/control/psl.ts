@@ -1,3 +1,4 @@
+import { tableOptions } from './options.js';
 import type {
   Contract,
   ColumnDefault,
@@ -29,6 +30,7 @@ import {
   toFieldName,
   toModelName,
 } from '@prisma/orm-family-sql/family/psl-infer';
+import { uuidText } from '../driver/uuid.js';
 import { ydbScalarDescriptors, yqlTypeForCodec } from '../runtime/codecs.js';
 import { ydbDuration } from './contract.js';
 import { ydbTableTtl } from './schema.js';
@@ -55,6 +57,7 @@ const attr = (
 ): PslAttribute => ({ kind: 'attribute', target, name, args, span });
 const typeNames: Record<string, string> = {
   Utf8: 'String',
+  Uuid: 'Uuid',
   Int32: 'Int',
   Int64: 'BigInt',
   Uint64: 'Uint64',
@@ -83,6 +86,7 @@ function defaultExpression(
     return 'json`' + JSON.stringify(def.value).replaceAll('`', '\\`') + '`';
   if (nativeType.startsWith('Decimal'))
     return 'decimal`' + String(def.value).replaceAll('`', '\\`') + '`';
+  if (nativeType === 'Uuid') return 'uuid`' + uuidText(def.value) + '`';
   if (nativeType === 'Timestamp') return 'timestamp`' + String(def.value) + '`';
   if (nativeType === 'Date') return 'date`' + String(def.value) + '`';
   if (nativeType === 'String')
@@ -224,6 +228,44 @@ function model(shape: ModelShape): PslModel {
           'expireAfter',
           JSON.stringify(ydbDuration(ttl.expireAfterSeconds)),
         ),
+      ]),
+    );
+  const managed = tableOptions(shape.table);
+  if (managed.partitioning) {
+    const settings = managed.partitioning;
+    const keys = [
+      'bySize',
+      'byLoad',
+      'minPartitions',
+      'maxPartitions',
+      'uniformPartitions',
+    ] as const;
+    const args = keys
+      .filter((key) => settings[key] !== undefined)
+      .map((key) => named(key, String(settings[key])));
+    if (args.length) attributes.push(attr('model', 'partitioning', args));
+  }
+  const pascal = (value: string) =>
+    value
+      .toLowerCase()
+      .split('_')
+      .map((part) => part[0]!.toUpperCase() + part.slice(1))
+      .join('');
+  for (const feed of managed.changefeeds ?? [])
+    attributes.push(
+      attr('model', 'changefeed', [
+        positional(JSON.stringify(feed.name)),
+        named('mode', pascal(feed.mode)),
+        named('format', pascal(feed.format)),
+        named('retention', JSON.stringify(ydbDuration(feed.retentionSeconds))),
+        ...(feed.partitions !== undefined &&
+        ['Uint32', 'Uint64'].includes(
+          shape.table.columns[shape.table.primaryKey!.columns[0]!]!.nativeType,
+        )
+          ? [named('partitions', String(feed.partitions))]
+          : []),
+        named('autoPartitioning', String(feed.autoPartitioning)),
+        named('consumers', JSON.stringify(feed.consumers)),
       ]),
     );
   if (shape.name !== shape.table.name)

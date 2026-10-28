@@ -1,3 +1,9 @@
+import { quoteYdbIdentifier } from './literals.js';
+export {
+  quoteYdbIdentifier,
+  ydbDuration,
+  ydbDurationSeconds,
+} from './literals.js';
 import {
   CrossReferenceSchema,
   type Contract,
@@ -15,6 +21,12 @@ import {
   type SqlStorage,
   type StorageTable,
 } from '@prisma/orm-family-sql/contract/types';
+
+import {
+  normalizeYdbOptions,
+  optionsForTable,
+  ydbOptionsKind,
+} from './options.js';
 
 export const YDB_CONTROL_TABLES: ReadonlySet<string> = new Set([
   '_prisma_marker',
@@ -34,30 +46,6 @@ export const YDB_TEMPORAL_CODECS: ReadonlySet<string> = new Set([
   'ydb/timestamp-us@1',
   'ydb/date@1',
 ]);
-
-export function ydbDurationSeconds(value: string): number {
-  const match = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/.exec(
-    value,
-  );
-  if (
-    !match ||
-    !match.slice(1).some((part) => part !== undefined) ||
-    value.endsWith('T')
-  )
-    throw new Error(
-      'TTL expireAfter must be a non-empty ISO-8601 duration with whole days, hours, minutes or seconds.',
-    );
-  const seconds =
-    Number(match[1] ?? 0) * 86400 +
-    Number(match[2] ?? 0) * 3600 +
-    Number(match[3] ?? 0) * 60 +
-    Number(match[4] ?? 0);
-  if (!Number.isSafeInteger(seconds) || seconds > 9223372036854)
-    throw new Error('TTL expireAfter exceeds the YDB Interval range.');
-  return seconds;
-}
-
-export const ydbDuration = (seconds: number): string => `PT${seconds}S`;
 
 const ttlKind = {
   kind: 'ttl',
@@ -81,19 +69,12 @@ const ttlKind = {
   construct: (input: YdbTtl): YdbTtl => Object.freeze({ ...input }),
 };
 
-const ydbEntityKinds = composeSqlEntityKinds([ttlKind]);
+const ydbEntityKinds = composeSqlEntityKinds([ttlKind, ydbOptionsKind]);
 
 export function ydbTtlEntries(namespace: {
   readonly entries: SqlNamespaceEntries;
 }): Readonly<Record<string, YdbTtl>> {
   return (namespace.entries['ttl'] ?? {}) as Readonly<Record<string, YdbTtl>>;
-}
-
-/** Quote an identifier, including a database-relative table path. */
-export function quoteYdbIdentifier(value: string): string {
-  if (value.includes('\0'))
-    throw new Error('YDB identifiers cannot contain NUL.');
-  return '`' + value.replaceAll('\\', '\\\\').replaceAll('`', '\\`') + '`';
 }
 
 /** A YDB connection is already bound to one database. */
@@ -104,6 +85,7 @@ export class YdbNamespace extends SqlNamespaceBase {
 
   constructor(input: SqlNamespaceInput) {
     super();
+    input = normalizeYdbOptions(input);
     // Namespace implementation tags are runtime metadata. Hashing and snapshots
     // must agree on the persisted namespace shape (id + entries).
     Object.defineProperty(this, 'kind', {
@@ -145,7 +127,7 @@ export class YdbContractSerializer extends SqlContractSerializerBase<
   Contract<SqlStorage>
 > {
   constructor() {
-    super(undefined, [ttlKind]);
+    super(undefined, [ttlKind, ydbOptionsKind]);
   }
   override deserializeContract<T extends Contract = Contract<SqlStorage>>(
     json: unknown,
@@ -183,6 +165,24 @@ export function validateYdbContract(contract: Contract<SqlStorage>): void {
         );
       if (!table.primaryKey || table.primaryKey.columns.length === 0)
         throw new Error(`YDB table ${name} requires a primary key.`);
+      const managed = optionsForTable(namespace, name);
+      if (
+        managed.partitioning?.uniformPartitions !== undefined ||
+        managed.changefeeds?.some((feed) => feed.partitions !== undefined)
+      ) {
+        const first = table.primaryKey.columns[0];
+        if (
+          !first ||
+          !['ydb/uint64@1', 'ydb/uint32@1'].includes(
+            table.columns[first]?.codecId ?? '',
+          )
+        )
+          throw new Error(
+            'Uniform table/topic partitions require a Uint32/Uint64-leading primary key (' +
+              name +
+              ').',
+          );
+      }
       for (const key of table.foreignKeys) {
         if (key.onDelete === undefined && key.onUpdate === undefined)
           throw new Error(

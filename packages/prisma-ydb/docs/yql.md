@@ -26,6 +26,27 @@ Bind user values as parameters. Table and column names cannot be value
 parameters; choose dynamic identifiers from trusted application definitions.
 ORM queries encode values automatically using the contract.
 
+## Native UUID parameters
+
+```ts
+import { UuidValue, Optional, List, Struct } from 'prisma-ydb/runtime';
+
+const id = new UuidValue('00112233-4455-6677-8899-AABBCCDDEEFF');
+const rows = await db.yql(
+  `DECLARE $rows AS List<Struct<id:Uuid,related:Uuid?>>;
+   SELECT id, related FROM AS_TABLE($rows);`,
+  { rows: new List(new Struct({ id, related: new Optional(null, id.type) })) },
+);
+// rows[0].id === '00112233-4455-6677-8899-aabbccddeeff'
+```
+
+ORM UUIDs and `UuidValue` require the hyphenated hexadecimal shape and normalize case.
+`Uuid` remains the unmodified SDK primitive. Native UUID `ORDER BY` and range
+comparisons use YDB byte order; JavaScript UUID string sorting can disagree.
+Native decoding retains all 128 bits and returns lowercase strings, recursively
+inside optional, list and struct results. Bind UUID values explicitly; a plain
+string remains Utf8 unless a compiled ORM parameter declares the UUID codec.
+
 ## Result sets, timeouts and statistics
 
 Use exact native typed values for parameterized decimals and microseconds:
@@ -104,6 +125,7 @@ by default.
 
 | Type            | ORM                                                  | Decoded native YQL    |
 | --------------- | ---------------------------------------------------- | --------------------- |
+| Uuid            | canonical lowercase UUID `string`                    | UUID `string`        |
 | Utf8            | `string`                                             | `string`              |
 | Bool            | `boolean`                                            | `boolean`             |
 | Int32           | `number`                                             | `number`              |

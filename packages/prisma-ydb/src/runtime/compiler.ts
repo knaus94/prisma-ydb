@@ -286,7 +286,7 @@ class YqlCompiler {
         return `${expr.fn.toUpperCase()}(${expr.expr ? render(expr.expr) : '*'})`;
       case 'cast': {
         if (
-          !/^(?:Bool|Int(?:8|16|32|64)|Uint(?:8|16|32|64)|Float|Double|Utf8|String|Json|JsonDocument|Date|Datetime|Timestamp|Interval|Decimal\((?:[1-9]|[12]\d|3[0-5]),\s*\d{1,2}\))\??$/.test(
+          !/^(?:Bool|Int(?:8|16|32|64)|Uint(?:8|16|32|64)|Float|Double|Utf8|String|Uuid|Json|JsonDocument|Date|Datetime|Timestamp|Interval|Decimal\((?:[1-9]|[12]\d|3[0-5]),\s*\d{1,2}\))\??$/.test(
             expr.targetType,
           )
         )

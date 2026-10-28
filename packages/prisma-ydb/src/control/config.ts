@@ -53,6 +53,7 @@ import {
   YDB_TEMPORAL_CODECS,
   ydbDurationSeconds,
 } from './contract.js';
+import { ydbModelAttributes } from './attributes.js';
 import { ydbMutationDefaults } from './defaults.js';
 import { ydbQueryOperations } from '../runtime/operations.js';
 import { ydbControlDriverDescriptor } from './driver.js';
@@ -61,6 +62,7 @@ import { diffYdbSchema, ydbContractToSchema } from './schema.js';
 import { YdbMigrationPlanner } from './planner.js';
 import { YdbMigrationRunner } from './runner.js';
 import { inferYdbPsl, printYdbPsl } from './psl.js';
+import { uuidText } from '../driver/uuid.js';
 import { dateText, timestampText } from '../runtime/temporal.js';
 import { ydbCreateApplicationRelationsNamespace } from './relations.js';
 
@@ -115,6 +117,11 @@ const ttlAttribute = {
 };
 
 const authoringDataTypes: Readonly<Record<string, DataTypeAuthoringEntry>> = {
+  'ydb/uuid': {
+    documentation: 'Canonical YDB UUID.',
+    written: { kind: 'tag', tag: 'uuid', parse: uuidText },
+    print: String,
+  },
   'ydb/date': {
     documentation: 'YDB calendar day in UTC.',
     written: { kind: 'tag', tag: 'date', parse: dateText },
@@ -304,7 +311,7 @@ export const ydbControlAdapterDescriptor: ControlAdapterDescriptor<
         Date: temporalCodecPreset({ codecId: 'ydb/date@1' }),
       },
     },
-    modelAttributes: { ttl: ttlAttribute },
+    modelAttributes: { ttl: ttlAttribute, ...ydbModelAttributes },
     valueObjectStorageType: 'Json',
     dataTypes: authoringDataTypes,
   },

@@ -25,7 +25,7 @@ import {
   ydbContractToSchema,
 } from './schema.js';
 import {
-  stableShape,
+  matchesTableShape,
   tableShape,
   type YdbMigrationOperation,
 } from './planner.js';
@@ -326,10 +326,7 @@ export class YdbMigrationRunner implements MigrationRunner<'sql', 'ydb'> {
           let live = tableShape(
             await introspectYdbTable(driver.core, op.target.details.table),
           );
-          if (
-            journal[0] &&
-            stableShape(live) === stableShape(op.meta.ydbAfter)
-          ) {
+          if (journal[0] && matchesTableShape(live, op.meta.ydbAfter)) {
             await markApplied(
               driver,
               journalPlanId,
@@ -338,7 +335,7 @@ export class YdbMigrationRunner implements MigrationRunner<'sql', 'ydb'> {
             );
             continue;
           }
-          if (stableShape(live) !== stableShape(op.meta.ydbBefore))
+          if (!matchesTableShape(live, op.meta.ydbBefore))
             throw new Error(
               `Schema drift at ${operationId} (plan ${journalPlanId}); live table matches neither the migration's expected start nor its recorded completed state.`,
             );
@@ -355,7 +352,7 @@ export class YdbMigrationRunner implements MigrationRunner<'sql', 'ydb'> {
           live = tableShape(
             await introspectYdbTable(driver.core, op.target.details.table),
           );
-          if (stableShape(live) !== stableShape(op.meta.ydbAfter))
+          if (!matchesTableShape(live, op.meta.ydbAfter))
             throw new Error(
               `DDL completed but schema verification failed at ${operationId}. Marker remains unchanged; inspect the journal and live schema before retry.`,
             );

@@ -8,6 +8,10 @@ Pinned compatibility: Prisma CLI **8.0.0-rc.24**, ORM platform packages
 **8.0.0-rc.18**, YDB JS SDK **6.3.1**. This is an experimental RC integration,
 not a certified production release. It uses the Prisma 8 SQL-family API with typed collections, fragments and contracts.
 
+Native `Uuid` columns use canonical lowercase strings in JavaScript. Prepared
+handles execute directly on the client or a live transaction; see the package
+API guides for UUID parameters and prepared selections.
+
 ## Development
 
 Use Node `^24.11.0 || >=26.0.0`. Yarn 4.18.1 is included in `.yarn/releases`.
@@ -21,8 +25,17 @@ yarn release:dry-run
 
 Without a Yarn launcher, use `node .yarn/releases/yarn-4.18.1.cjs` in place of
 `yarn`. Checks cover lint, TypeScript/build, package validation and migration
-validation. They do not connect to a database. There is currently no automated
-driver regression suite; the runnable example is a usage demonstration.
+validation. The offline checks do not connect to a database. The opt-in live
+integration suite uses Node 24's test runner with one file at a time:
+
+```bash
+YDB_CONNECTION_STRING=grpc://localhost:2137/local YDB_ANONYMOUS_CREDENTIALS=1 yarn test:integration
+```
+
+Use an empty, disposable database: migration cases refuse pre-existing deployment
+metadata, and each fixture drops its own tables, feeds and migration metadata in
+after hooks. Missing `YDB_CONNECTION_STRING` is an error. CI runs this suite on
+local YDB 26.2.1.14 with two CPU cores and a 3 GB memory limit.
 
 ## Run the example
 
@@ -53,6 +66,7 @@ the authored source remains `.prisma`.
 
 | Command                                               | Purpose                                                      |
 | ----------------------------------------------------- | ------------------------------------------------------------ |
+| `yarn test:integration`                              | Run the sequential live driver integration suite          |
 | `yarn build`                                          | Build ESM and declarations                                   |
 | `yarn lint`, `yarn typecheck`, `yarn check`           | Validate library and consumer                                |
 | `yarn package:pack`                                   | Create an npm tarball in `artifacts/`                        |

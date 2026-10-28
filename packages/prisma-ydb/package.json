@@ -95,12 +95,13 @@
         "cache": true,
         "inputs": [
           "{projectRoot}/src/**/*.ts",
+          "{projectRoot}/test/**/*.ts",
           "{workspaceRoot}/eslint.config.mjs",
           "{workspaceRoot}/package.json",
           "{workspaceRoot}/yarn.lock"
         ],
         "options": {
-          "command": "eslint packages/prisma-ydb/src",
+          "command": "eslint packages/prisma-ydb/src packages/prisma-ydb/test",
           "cwd": "{workspaceRoot}"
         }
       },
@@ -110,6 +111,17 @@
         ],
         "options": {
           "command": "tsc --build tsconfig.json"
+        }
+      },
+      "test-integration": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "cache": false,
+        "options": {
+          "command": "node scripts/integration.mjs",
+          "cwd": "{workspaceRoot}"
         }
       },
       "package-check": {

@@ -24,6 +24,8 @@ import type {
   YdbQueryRequest,
   YdbSqlExecuteRequest,
 } from './types.js';
+import { uuidFromBigInts } from '@ydbjs/value/uuid';
+import { UuidValue } from './uuid.js';
 import { ydbJsonForm } from './json-form.js';
 
 const primitiveTypes: Record<string, PrimitiveId> = {
@@ -262,6 +264,8 @@ export function sqlRequest(
         value = new Double(parameter);
       else if (baseType === 'Utf8' && typeof parameter === 'string')
         value = new Text(parameter);
+      else if (baseType === 'Uuid' && typeof parameter === 'string')
+        value = new UuidValue(parameter);
       else if (baseType === 'Bool' && typeof parameter === 'boolean')
         value = new Bool(parameter);
       if (!value)
@@ -460,6 +464,10 @@ export function decodeValue(value: WireValue, type: Type): unknown {
       case PrimitiveId.INTERVAL:
       case PrimitiveId.INTERVAL64:
         return value.value.value;
+      case PrimitiveId.UUID:
+        if (value.value.case !== 'low128')
+          throw new SqlQueryError('YDB returned an invalid Uuid value');
+        return uuidFromBigInts(value.value.value, value.high128);
       case PrimitiveId.JSON:
       case PrimitiveId.JSON_DOCUMENT:
         return JSON.parse(value.value.value as string);

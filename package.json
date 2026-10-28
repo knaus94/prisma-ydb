@@ -29,6 +29,7 @@
     "build": "nx build prisma-ydb",
     "lint": "nx run-many -t lint -p prisma-ydb,basic",
     "typecheck": "nx run-many -t typecheck -p prisma-ydb,basic",
+    "test:integration": "nx run prisma-ydb:test-integration --parallel=2",
     "check": "nx run-many -t lint,typecheck,build,package-check,migration-check -p prisma-ydb,basic && nx run workspace:scripts-lint",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

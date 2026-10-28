@@ -100,7 +100,9 @@ export const ydbMutationDefaults: ControlMutationDefaults = {
   generatorDescriptors: [
     ...builtinGeneratorRegistryMetadata.map(({ id }) => ({
       id,
-      applicableCodecIds: ['ydb/utf8@1'],
+      applicableCodecIds: ['uuidv4', 'uuidv7'].includes(id)
+        ? ['ydb/utf8@1', 'ydb/uuid@1']
+        : ['ydb/utf8@1'],
     })),
     timestampNowControlDescriptor(),
   ],

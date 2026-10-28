@@ -28,3 +28,43 @@ jobs:
           name: npm-package
           path: artifacts/*.tgz
           if-no-files-found: error
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NX_DAEMON: 'false'
+      NX_ISOLATE_PLUGINS: 'false'
+      NX_NO_CLOUD: 'true'
+      YDB_CONNECTION_STRING: grpc://127.0.0.1:2136/local
+      YDB_ANONYMOUS_CREDENTIALS: '1'
+    services:
+      ydb:
+        # Local YDB 26.2.1.14; pin the verified image rather than a moving tag.
+        image: ydbplatform/local-ydb@sha256:9e46fd45875551a75bcf34d0bb9ca0baa1d8763a4ccf2070af45f4467c4b7402
+        env:
+          GRPC_PORT: '2136'
+          MON_PORT: '8765'
+          YDB_USE_IN_MEMORY_PDISKS: 'false'
+          YDB_DEFAULT_LOG_LEVEL: NOTICE
+        ports:
+          - 2136:2136
+        options: >-
+          --hostname localhost
+          --cpus=2
+          --memory=3g
+          --memory-swap=3g
+          --health-cmd /health_check
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: corepack enable
+      - run: yarn install --immutable
+      - run: nice -n 10 yarn test:integration

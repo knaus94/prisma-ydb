@@ -29,3 +29,9 @@ export {
   listYdbTables,
 } from './schema.js';
 export { MigrationCLI } from '@prisma/orm-toolchain/cli/migration-cli';
+
+export type {
+  YdbPartitioning,
+  YdbChangefeed,
+  YdbTableOptions,
+} from './options.js';

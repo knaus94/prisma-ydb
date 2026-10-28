@@ -1,3 +1,10 @@
+import {
+  tableOptions,
+  optionsForTable,
+  matchesOptions,
+  readTableOptions,
+  type YdbTableOptions,
+} from './options.js';
 import { anyUnpack } from '@bufbuild/protobuf/wkt';
 import {
   SchemeServiceDefinition,
@@ -16,6 +23,7 @@ import { StatusIds_StatusCode, type Operation } from '@ydbjs/api/operation';
 import { Type_PrimitiveTypeId, type Type } from '@ydbjs/api/value';
 import { ydbTableExists } from '../driver/scheme.js';
 import { decodeValue } from '../driver/values.js';
+import { uuidText } from '../driver/uuid.js';
 import { decimalText } from '../runtime/decimal.js';
 import { yqlTypeForCodec } from '../runtime/codecs.js';
 import {
@@ -59,6 +67,21 @@ export function ydbTableTtl(table: SqlTableIR): YdbTtl | undefined {
 }
 
 class YdbTableIR extends SqlTableIR {
+  explainMismatch(other: DiffableNode | undefined): string | undefined {
+    if (
+      other instanceof SqlTableIR &&
+      !matchesOptions(tableOptions(other), tableOptions(this))
+    )
+      return (
+        'YDB partitioning/changefeed drift on ' +
+        this.name +
+        ': expected ' +
+        JSON.stringify(tableOptions(this)) +
+        '; actual ' +
+        JSON.stringify(tableOptions(other))
+      );
+    return undefined;
+  }
   override isEqualTo(other: DiffableNode): boolean {
     const expected = ydbTableTtl(this);
     const actual = other instanceof SqlTableIR ? ydbTableTtl(other) : undefined;
@@ -67,7 +90,8 @@ class YdbTableIR extends SqlTableIR {
       super.isEqualTo(other) &&
       expected?.table === actual?.table &&
       expected?.column === actual?.column &&
-      expected?.expireAfterSeconds === actual?.expireAfterSeconds
+      expected?.expireAfterSeconds === actual?.expireAfterSeconds &&
+      matchesOptions(tableOptions(other), tableOptions(this))
     );
   }
 }
@@ -156,7 +180,11 @@ async function withTableSession<T>(
   try {
     result = await fn(async (name) => {
       const response = await client.describeTable(
-        { sessionId: session.sessionId, path: `${core.database}/${name}` },
+        {
+          sessionId: session.sessionId,
+          path: `${core.database}/${name}`,
+          includeTableStats: true,
+        },
         { signal: AbortSignal.timeout(30_000) },
       );
       const decoded = anyUnpack(
@@ -240,6 +268,7 @@ export function renderYdbLiteral(value: unknown, type: string): string {
     return `${type}(${JSON.stringify(encoded)})`;
   }
   if (value === null) return 'NULL';
+  if (type === 'Uuid') return `Uuid(${JSON.stringify(uuidText(value))})`;
   if (type === 'Date') return `Date(${JSON.stringify(dateText(value))})`;
   if (type === 'Timestamp')
     return `Timestamp(${JSON.stringify(timestampText(value))})`;
@@ -271,7 +300,11 @@ function rawDefault(def: ColumnDefault, type: string): string {
   return renderYdbLiteral(def.value, type);
 }
 
-function tableToSchema(name: string, table: DescribeTableResult): SqlTableIR {
+function tableToSchema(
+  name: string,
+  table: DescribeTableResult,
+  options: YdbTableOptions,
+): SqlTableIR {
   if (table.temporary || table.storeType === StoreType.COLUMN)
     throw new Error(
       `YDB temporary or column-oriented table ${name} is not supported by the row-table migration model.`,
@@ -342,19 +375,20 @@ function tableToSchema(name: string, table: DescribeTableResult): SqlTableIR {
   const ttl = table.ttlSettings?.mode;
   return new YdbTableIR({
     name,
-    ...(ttl?.case === 'dateTypeColumn'
-      ? {
-          annotations: {
-            ydb: {
+    annotations: {
+      ydb: {
+        ...options,
+        ...(ttl?.case === 'dateTypeColumn'
+          ? {
               ttl: {
                 table: name,
                 column: ttl.value.columnName,
                 expireAfterSeconds: Number(ttl.value.expireAfterSeconds),
               } satisfies YdbTtl,
-            },
-          },
-        }
-      : {}),
+            }
+          : {}),
+      },
+    },
     columns,
     primaryKey: { columns: table.primaryKey },
     foreignKeys: [],
@@ -389,9 +423,14 @@ export async function introspectYdbTable(
 ): Promise<SqlTableIR | undefined> {
   if (CONTROL_TABLES.has(name) || !(await ydbTableExists(core, name)))
     return undefined;
-  return withTableSession(core, async (describe) =>
-    tableToSchema(name, await describe(name)),
-  );
+  return withTableSession(core, async (describe) => {
+    const table = await describe(name);
+    return tableToSchema(
+      name,
+      table,
+      await readTableOptions(core, table, name),
+    );
+  });
 }
 
 export async function introspectYdb(core: Driver): Promise<SqlSchemaIR> {
@@ -405,7 +444,11 @@ export async function introspectYdb(core: Driver): Promise<SqlSchemaIR> {
         while (next < names.length) {
           const name = names[next++];
           const table = await describe(name);
-          tables[name] = tableToSchema(name, table);
+          tables[name] = tableToSchema(
+            name,
+            table,
+            await readTableOptions(core, table, name),
+          );
         }
       }),
     );
@@ -423,6 +466,15 @@ export function ydbContractToSchema(
 ): SqlSchemaIR {
   if (contract) validateYdbContract(contract);
   const types = sqlTypeLookupsOf(components);
+  const managedByTable = new Map(
+    contract
+      ? Object.values(contract.storage.namespaces).flatMap((namespace) =>
+          Object.entries(namespace.entries.table ?? {}).map(
+            ([name]) => [name, optionsForTable(namespace, name)] as const,
+          ),
+        )
+      : [],
+  );
   const ttlByTable = new Map(
     contract
       ? Object.values(contract.storage.namespaces).flatMap((namespace) =>
@@ -476,9 +528,12 @@ export function ydbContractToSchema(
           ...table,
           ...(() => {
             const ttl = ttlByTable.get(name);
-            return ttl
-              ? { annotations: { ...table.annotations, ydb: { ttl } } }
-              : {};
+            return {
+              annotations: {
+                ...table.annotations,
+                ydb: { ...managedByTable.get(name), ...(ttl ? { ttl } : {}) },
+              },
+            };
           })(),
           columns: Object.fromEntries(
             Object.entries(table.columns).map(([columnName, column]) => {

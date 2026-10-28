@@ -380,7 +380,7 @@ export function ydb<C extends Contract<SqlStorage>>(
       if (boundRuntime === runtime) await ensureConnected();
       return native.executeYql({ transactionMode: 'serializable', ...request });
     };
-    return {
+    const result: YdbQueryMembers<C> = {
       ...scoped,
       get orm() {
         return (orm ??= createOrm());
@@ -406,6 +406,19 @@ export function ydb<C extends Contract<SqlStorage>>(
         return result.resultSets.flatMap((set) => set.rows);
       },
     };
+    // The pinned SQL runtime exposes prepared execution through symbol methods.
+    // Forward those capabilities without importing its private symbol module.
+    for (const key of Object.getOwnPropertySymbols(SqlRuntimeBase.prototype)) {
+      const bridge: unknown = Reflect.get(boundRuntime, key);
+      if (typeof bridge !== 'function') continue;
+      Object.defineProperty(result, key, {
+        value: (...args: unknown[]) => {
+          checkActive();
+          return Reflect.apply(bridge, boundRuntime, args);
+        },
+      });
+    }
+    return result;
   };
   const rootMembers = members(runtime, nativeDriver, () => {
     if (closed) throw new Error('YDB client is closed');

@@ -167,6 +167,7 @@ function jsonProjection(
     case 'ydb/uint64@1':
     case 'ydb/number@1':
     case 'ydb/decimal@1':
+    case 'ydb/uuid@1':
     case 'ydb/date@1':
     case 'ydb/timestamp-us@1':
       return `CAST(${rendered} AS Utf8)`;

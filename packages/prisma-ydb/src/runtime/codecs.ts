@@ -23,6 +23,7 @@ import {
   Uint64,
 } from '@ydbjs/value/primitive';
 import { DecimalValue, decimalText } from './decimal.js';
+import { UuidValue, uuidText } from '../driver/uuid.js';
 import { ydbJsonForm } from '../driver/json-form.js';
 export { ydbJsonForm } from '../driver/json-form.js';
 import {
@@ -210,6 +211,20 @@ export const ydbUtf8 = new YdbCodecDescriptor(
     fromJson: assertString,
     literal: (value) =>
       typeof value === 'string' ? renderTsLiteral(value) : undefined,
+  },
+  'string',
+);
+// Native UUID ordering follows YDB byte layout, not JS UUID string ordering.
+export const ydbUuid = new YdbCodecDescriptor(
+  'ydb/uuid@1',
+  ['equality', 'order'] as const,
+  'Uuid',
+  {
+    read: uuidText,
+    wire: (value: string) => new UuidValue(value),
+    json: uuidText,
+    fromJson: uuidText,
+    literal: (value) => renderTsLiteral(uuidText(value)),
   },
   'string',
 );
@@ -420,6 +435,7 @@ export const ydbDecimal = new YdbDecimalDescriptor();
 
 export const ydbCodecDescriptors = [
   ydbUtf8,
+  ydbUuid,
   ydbInt32,
   ydbInt64,
   ydbUint64,
@@ -447,6 +463,7 @@ export const ydbDataTypes = [
 });
 export const ydbScalarDescriptors = {
   String: ydbUtf8,
+  Uuid: ydbUuid,
   Int: ydbInt32,
   BigInt: ydbInt64,
   Boolean: ydbBool,
@@ -459,6 +476,12 @@ export const ydbScalarDescriptors = {
   Decimal: ydbDecimal,
 } as const;
 export type CodecTypes = {
+  readonly 'ydb/uuid@1': {
+    input: string;
+    output: string;
+    json: string;
+    traits: 'equality' | 'order';
+  };
   readonly 'ydb/date@1': {
     input: string | Date;
     output: string;
