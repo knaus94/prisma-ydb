@@ -25,6 +25,8 @@ test('Typed YQL generates, typechecks, executes on db/tx and reports generation 
   const sources = {
     'save-item.yql': `DECLARE $id AS Utf8; DECLARE $amount AS Decimal(12,2)?; DECLARE $at AS Timestamp; UPSERT INTO ${table} (id, amount, at) VALUES ($id, $amount, $at);`,
     'item-history.yql': `DECLARE $ids AS List<Utf8>; SELECT id, amount, at FROM ${table} WHERE id IN $ids ORDER BY id; SELECT COUNT(*) AS total, MAX(at) AS last FROM ${table};`,
+    // EXPLAIN keeps a binding for DISCARD; the client receives two result sets.
+    'discard-summary.yql': `DECLARE $ids AS List<Utf8>; SELECT id FROM ${table} WHERE id IN $ids ORDER BY id; DISCARD SELECT COUNT(*) AS skipped FROM ${table}; SELECT COUNT(*) AS total FROM ${table};`,
   };
   for (const [file, text] of Object.entries(sources))
     await writeFile(join(dir, file), text);
@@ -54,7 +56,7 @@ test('Typed YQL generates, typechecks, executes on db/tx and reports generation 
     '-p',
     join(fixture.cwd, 'tsconfig.yql.json'),
   ]);
-  const { saveItem, itemHistory } = await import(
+  const { saveItem, itemHistory, discardSummary } = await import(
     pathToFileURL(join(fixture.cwd, 'compiled/yql.js')).href
   );
   // EXPLAIN must not execute the mutation.
@@ -74,6 +76,15 @@ test('Typed YQL generates, typechecks, executes on db/tx and reports generation 
     ]);
     assert.deepEqual(summary, [{ last: at + 1n, total: 2n }]);
   });
+  assert.doesNotMatch(generated, /skipped: /);
+  assert.match(
+    generated,
+    /DiscardSummaryResult = \[DiscardSummaryRow1\[\], DiscardSummaryRow2\[\]\]/,
+  );
+  assert.deepEqual(await discardSummary(fixture.db, { ids: ['one'] }), [
+    [{ id: 'one' }],
+    [{ total: 2n }],
+  ]);
   await generateYql({ config: fixture.configPath, check: true });
   await exec(process.execPath, [
     cli,

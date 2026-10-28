@@ -223,7 +223,7 @@ export async function generateYql(
         const { ast, plan } = await driver.explainYql(source.text);
         sources[index] = {
           ...source,
-          results: inferYqlResults(ast, plan, source.file),
+          results: inferYqlResults(ast, plan, source.file, source.text),
         };
       } catch (error) {
         const issues =

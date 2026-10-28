@@ -83,6 +83,9 @@ The generator uses QueryService **EXPLAIN**, never EXECUTE. It parses parameter
 `execStats.queryAst`, resolving aliases and cross-checking the result count with
 the JSON query plan. This depends on the AST format of pinned YDB 26.2.1.14;
 revalidate on upgrades. Unknown plan shapes fail loudly instead of guessing.
+EXPLAIN also keeps a binding for `DISCARD` statements, whose results never reach
+the client; the generator drops them by source statement order. Files that mix
+`DISCARD` with actions, subqueries or `EVALUATE`/`DO` blocks fail generation.
 YDB diagnostics include the source file. Unused parameter declarations also fail,
 catching typos before generation. Runtime type parsing and codec compilation run
 once at module load, outside the per-call path. Generator modules are exported

@@ -1,3 +1,4 @@
+import { yqlCode, yqlResultStatements } from '../driver/yql-syntax.js';
 export type SExpression = string | SExpression[];
 
 /** Parse YDB's printed AST, including quote shorthand and escaped string atoms. */
@@ -63,6 +64,7 @@ export function inferYqlResults(
   ast: string,
   plan: string,
   file: string,
+  text?: string,
 ): YqlColumnType[][] {
   try {
     const root = parseSExpression(ast);
@@ -167,6 +169,16 @@ export function inferYqlResults(
             `Plan result count ${count} differs from bindings ${results.length}`,
           );
       }
+    }
+    // EXPLAIN keeps a binding for DISCARD statements, but the client never
+    // receives that result set; drop them by source statement order.
+    if (text !== undefined && /\bDISCARD\b/i.test(yqlCode(text))) {
+      const statements = yqlResultStatements(text);
+      if (!statements || statements.length !== results.length)
+        throw new Error(
+          `cannot map DISCARD statements to ${results.length} result bindings`,
+        );
+      return results.filter((_columns, index) => !statements[index]!.discarded);
     }
     return results;
   } catch (error) {

@@ -220,3 +220,42 @@ test('defineYql compiles codecs once and encodes/decodes single, tuple and void 
     /result-set count mismatch/,
   );
 });
+
+test('DISCARD statements are attributed to result bindings by source order', async () => {
+  const { yqlResultStatements } =
+    await import('../../dist/driver/yql-syntax.js');
+  const discarded = (text: string) =>
+    yqlResultStatements(text)?.map((statement) => statement.discarded);
+  assert.deepEqual(
+    discarded('SELECT 1 AS a; DISCARD SELECT 2 AS b; SELECT 3 AS c;'),
+    [false, true, false],
+  );
+  assert.deepEqual(
+    discarded(
+      "-- DISCARD SELECT 0;\nSELECT 'DISCARD; SELECT' AS a; /* DISCARD */ discard select 2 AS b",
+    ),
+    [false, true],
+  );
+  assert.deepEqual(
+    discarded(
+      'DECLARE $id AS Utf8; PRAGMA TablePathPrefix("/local"); $x = SELECT 1 AS z; DISCARD SELECT * FROM $x; (SELECT 1 AS u) UNION ALL (SELECT 2 AS u);',
+    ),
+    [true, false],
+  );
+  assert.deepEqual(
+    discarded(
+      'UPSERT INTO t (id) VALUES ($id); UPDATE t SET v = 1 WHERE id = $id RETURNING id; DELETE FROM t WHERE id = $id;',
+    ),
+    [false],
+  );
+  assert.equal(
+    yqlResultStatements(
+      'DEFINE ACTION $a() AS SELECT 1; END DEFINE; DISCARD SELECT 2;',
+    ),
+    undefined,
+  );
+  assert.equal(
+    yqlResultStatements('EVALUATE FOR $i IN [1] DO $a($i); DISCARD SELECT 2;'),
+    undefined,
+  );
+});
