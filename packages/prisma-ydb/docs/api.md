@@ -334,12 +334,43 @@ for await (const batch of db.changefeed('Order', { consumer: 'app' })) {
 }
 ```
 
-Values are decoded with the model's codecs (BigInt as `bigint`, Decimal as a
-string, lists as arrays); unmapped columns are ignored and `event.raw` keeps the
-server record. `feed` is required when the model declares several changefeeds,
-and the consumer must exist on the topic (declare it in `consumers`). The
-iterator ends when `signal` aborts or the client closes; uncommitted batches are
-delivered again to the next reader of that consumer.
+Values are decoded with the model's codecs: `BigInt`/`Uint64` as exact `bigint`
+(YDB writes them as bare JSON numbers, which are parsed from their source text,
+never through doubles), `Decimal` as a string, `Date` as `YYYY-MM-DD`, lists as
+arrays. Unmapped columns are ignored. `event.raw` keeps the server record with
+integers beyond `Number.MAX_SAFE_INTEGER` as decimal strings. `event.ts` is set
+only when the feed records virtual timestamps. `feed` is required when the model
+declares several changefeeds, and the consumer must exist on the topic (declare
+it in `consumers`). The iterator ends when `signal` aborts or the client closes;
+uncommitted batches are delivered again to the next reader of that consumer.
+
+Partition hooks follow assignment and rebalancing:
+
+```ts
+for await (const batch of db.changefeed('Order', {
+  consumer: 'app',
+  // Resume from offsets kept with your own data; return nothing to use the consumer's.
+  onPartitionStart: async ({ partitionId }) => {
+    const stored = await loadOffset(partitionId);
+    return stored === undefined ? undefined : { readOffset: stored };
+  },
+  // The partition moves to another reader; drop per-partition state.
+  onPartitionStop: ({ partitionId }) => forgetPartition(partitionId),
+  onCommitted: ({ partitionId, committedOffset }) =>
+    metrics.offset(partitionId, committedOffset),
+})) {
+  await apply(batch.events);
+  await batch.commit();
+}
+```
+
+Each hook receives `partitionId`, `partitionSessionId`, `committedOffset` and the
+retained `startOffset`/`endOffset`. A start position may set `commitOffset` and
+`readOffset` (not below the commit offset); omitted fields keep the server's
+committed position. Reading of a partition waits for its start hook. An
+exception thrown by a hook ends the iteration with that error. Committing a batch
+of a partition that has since been taken away rejects with an `Error`; its
+messages are redelivered to the partition's next reader.
 
 ## Type mapping
 

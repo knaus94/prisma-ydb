@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix `db.changefeed` precision loss: Int64/Uint64 values, keys and virtual timestamps arrive as bare JSON numbers and are now parsed from their source text into exact `bigint`s; `raw` keeps unsafe integers as decimal strings.
+- Fix `db.changefeed` decoding of `Date` columns, which YDB writes as midnight timestamps.
+- Add `onPartitionStart` (with an optional start position), `onPartitionStop` and `onCommitted` hooks to `db.changefeed`. Omitted start-position fields keep the server's committed offset, hook exceptions end the iteration, and commits of a revoked partition reject with an `Error`. Events expose `partitionSessionId`.
+
 ## 0.1.0-rc.4
 
 - Interactive transactions begin on the server with their first statement instead of a BeginTransaction RPC; empty transactions and rollbacks that never reached the server are local. `queryYql({ commit: true })` inside a transaction commits together with that statement.

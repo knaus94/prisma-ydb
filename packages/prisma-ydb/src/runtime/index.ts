@@ -13,6 +13,8 @@ export type {
   YdbChangeBatch,
   YdbChangeEvent,
   YdbChangefeedOptions,
+  YdbChangefeedPartition,
+  YdbChangefeedStartPosition,
 } from './changefeed.js';
 export type { YdbTransactionMode } from '../driver/index.js';
 export {

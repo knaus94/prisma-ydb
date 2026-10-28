@@ -1,4 +1,7 @@
-import { createTopicReader } from '@ydbjs/topic/reader';
+import {
+  createTopicReader,
+  type TopicReaderOptions,
+} from '@ydbjs/topic/reader';
 import type { TopicMessage } from '@ydbjs/topic/message';
 import type { Contract } from '@prisma/orm-framework/contract/types';
 import type { JsonValue } from '@prisma/orm-framework/contract/types';
@@ -6,6 +9,26 @@ import type { SqlStorage } from '@prisma/orm-family-sql/contract/types';
 import type { YdbDriver } from '../driver/driver.js';
 import { decodeYdbJson } from './codecs.js';
 import { resolveModel, type ModelColumn, type ResolvedModel } from './model.js';
+
+/** One topic partition assigned to this reader. */
+export interface YdbChangefeedPartition {
+  readonly partitionId: bigint;
+  /** Identifies this assignment; a reassigned partition gets a new session. */
+  readonly partitionSessionId: bigint;
+  /** The consumer's committed offset when the event was raised. */
+  readonly committedOffset: bigint;
+  /** Offsets currently retained in the partition, `end` exclusive. */
+  readonly startOffset: bigint;
+  readonly endOffset: bigint;
+}
+
+/** Positions to start an assigned partition from; omitted fields keep the server's. */
+export interface YdbChangefeedStartPosition {
+  /** Committed offset to set before reading; defaults to the current one. */
+  readonly commitOffset?: bigint;
+  /** First offset to deliver, not below `commitOffset`; defaults to it. */
+  readonly readOffset?: bigint;
+}
 
 export interface YdbChangefeedOptions {
   /** Topic consumer; declare it in `@@changefeed(consumers: [...])` or create it manually. */
@@ -22,6 +45,27 @@ export interface YdbChangefeedOptions {
   /** Skip messages older than this many milliseconds. */
   readonly maxLagMs?: number;
   readonly maxBufferBytes?: bigint;
+  /**
+   * The server assigned a partition to this reader. Return a start position to
+   * resume from offsets stored outside the topic; return nothing to resume
+   * after the consumer's committed offset. Reading of the partition waits for it.
+   */
+  readonly onPartitionStart?: (
+    partition: YdbChangefeedPartition,
+  ) =>
+    | void
+    | YdbChangefeedStartPosition
+    | Promise<void | YdbChangefeedStartPosition>;
+  /**
+   * The server is taking a partition away (rebalancing, reader shutdown or
+   * partition split). Batches of it that were not committed are delivered
+   * again to its next reader; committing them afterwards fails.
+   */
+  readonly onPartitionStop?: (
+    partition: YdbChangefeedPartition,
+  ) => void | Promise<void>;
+  /** The server acknowledged committed offsets for a partition. */
+  readonly onCommitted?: (partition: YdbChangefeedPartition) => void;
 }
 
 export interface YdbChangeEvent<Row = Record<string, unknown>> {
@@ -36,9 +80,13 @@ export interface YdbChangeEvent<Row = Record<string, unknown>> {
   readonly ts?: readonly [bigint, bigint];
   readonly offset: bigint | undefined;
   readonly partition: bigint | undefined;
+  readonly partitionSessionId: bigint | undefined;
   readonly seqNo: bigint;
   readonly writtenAt: Date | undefined;
-  /** The decoded JSON record exactly as the server sent it. */
+  /**
+   * The server record. Integers beyond Number.MAX_SAFE_INTEGER are kept as
+   * decimal strings so no digit is lost; other numbers are JavaScript numbers.
+   */
   readonly raw: JsonValue;
 }
 
@@ -48,35 +96,121 @@ export interface YdbChangeBatch<Row = Record<string, unknown>> {
   commit(): Promise<void>;
 }
 
-const integerCodecs = new Set(['ydb/int64@1', 'ydb/uint64@1', 'ydb/number@1']);
-
-/** Changefeed JSON is YDB's own encoding; align it with the codec JSON forms. */
-function normalize(column: ModelColumn, value: JsonValue): JsonValue {
-  if (integerCodecs.has(column.codecId) || column.codecId === 'ydb/decimal@1')
-    return typeof value === 'number' ? String(value) : value;
-  if (column.codecId === 'ydb/json@1' || column.many)
-    return typeof value === 'string' ? (JSON.parse(value) as JsonValue) : value;
-  return value;
+/**
+ * A JSON number kept as its source text. YDB writes Int64/Uint64 values and
+ * the `ts` pair as bare JSON numbers, which plain JSON.parse rounds to doubles.
+ */
+class JsonNumber {
+  constructor(readonly text: string) {}
 }
 
-function decodeField(column: ModelColumn, value: JsonValue): unknown {
-  if (value === null) return null;
-  const json = normalize(column, value);
+type Token =
+  | null
+  | boolean
+  | string
+  | JsonNumber
+  | Token[]
+  | { [key: string]: Token };
+
+/** Source-text access in JSON.parse revivers (Node 21+, required by engines). */
+const losslessJson =
+  JSON.parse('1', (_key, value: unknown, context?: { source?: string }) =>
+    typeof value === 'number' ? context?.source : value,
+  ) === '1';
+
+function parseTokens(text: string): Token {
+  if (!losslessJson)
+    throw new Error(
+      'db.changefeed needs JSON.parse source text access (Node 24+) to decode 64-bit integers exactly',
+    );
+  return JSON.parse(
+    text,
+    (_key, value: unknown, context?: { source?: string }) =>
+      typeof value === 'number' ? new JsonNumber(context!.source!) : value,
+  ) as Token;
+}
+
+const integerLiteral = /^-?\d+$/;
+
+/** JSON with every number as a JavaScript number, as ORM reads of Json columns return. */
+function plainJson(token: Token): JsonValue {
+  if (token instanceof JsonNumber) return Number(token.text);
+  if (Array.isArray(token)) return token.map(plainJson);
+  if (token && typeof token === 'object')
+    return Object.fromEntries(
+      Object.entries(token).map(([key, value]) => [key, plainJson(value)]),
+    );
+  return token;
+}
+
+/** JSON for `raw`: unsafe integers stay exact as decimal strings. */
+function rawJson(token: Token): JsonValue {
+  if (token instanceof JsonNumber) {
+    const value = Number(token.text);
+    return integerLiteral.test(token.text) && !Number.isSafeInteger(value)
+      ? token.text
+      : value;
+  }
+  if (Array.isArray(token)) return token.map(rawJson);
+  if (token && typeof token === 'object')
+    return Object.fromEntries(
+      Object.entries(token).map(([key, value]) => [key, rawJson(value)]),
+    );
+  return token;
+}
+
+/** Codecs whose JSON form is a decimal string rather than a number. */
+const textNumberCodecs = new Set([
+  'ydb/int64@1',
+  'ydb/uint64@1',
+  'ydb/number@1',
+  'ydb/decimal@1',
+]);
+/** CDC writes Date values as midnight timestamps. */
+const cdcDate = /^(\d{4}-\d{2}-\d{2})T00:00:00(?:\.0+)?Z$/;
+
+/** Changefeed JSON is YDB's own encoding; align one scalar with its codec's JSON form. */
+function codecJson(codecId: string, token: Token): JsonValue {
+  if (token instanceof JsonNumber)
+    return textNumberCodecs.has(codecId) ? token.text : Number(token.text);
+  if (codecId === 'ydb/json@1')
+    return typeof token === 'string'
+      ? (JSON.parse(token) as JsonValue)
+      : plainJson(token);
+  if (codecId === 'ydb/date@1' && typeof token === 'string')
+    return cdcDate.exec(token)?.[1] ?? token;
+  if (token !== null && typeof token === 'object')
+    throw new TypeError(`Changefeed value for ${codecId} is not a scalar`);
+  return token;
+}
+
+function decodeField(column: ModelColumn, token: Token): unknown {
+  if (token === null) return null;
   if (column.many) {
-    if (!Array.isArray(json))
+    // Lists are stored as Json holding the elements' codec JSON forms.
+    const list = typeof token === 'string' ? parseTokens(token) : token;
+    if (!Array.isArray(list))
       throw new TypeError(
         `Changefeed list column ${column.column} is not an array`,
       );
-    return json.map((element) =>
-      decodeYdbJson(column.codecId, element, column.typeParams),
+    return list.map((element) =>
+      decodeYdbJson(
+        column.codecId,
+        codecJson(column.codecId, element),
+        column.typeParams,
+      ),
     );
   }
-  return decodeYdbJson(column.codecId, json, column.typeParams);
+  return decodeYdbJson(
+    column.codecId,
+    codecJson(column.codecId, token),
+    column.typeParams,
+  );
 }
 
 function decodeImage(
   model: ResolvedModel,
-  image: JsonValue,
+  image: Token,
 ): Record<string, unknown> {
   if (typeof image !== 'object' || image === null || Array.isArray(image))
     throw new TypeError('Changefeed image is not an object');
@@ -90,53 +224,88 @@ function decodeImage(
 
 function decodeKey(
   model: ResolvedModel,
-  key: JsonValue,
+  key: Token | undefined,
 ): Record<string, unknown> {
   if (!Array.isArray(key) || key.length !== model.primaryKey.length)
     throw new TypeError('Changefeed key does not match the primary key');
   const row: Record<string, unknown> = {};
   model.primaryKey.forEach((column, index) => {
-    row[column.field] = decodeField(column, key[index] as JsonValue);
+    row[column.field] = decodeField(column, key[index] ?? null);
   });
   return row;
+}
+
+function virtualTimestamp(
+  ts: Token | undefined,
+): readonly [bigint, bigint] | undefined {
+  if (
+    !Array.isArray(ts) ||
+    ts.length !== 2 ||
+    !ts.every(
+      (part) => part instanceof JsonNumber && integerLiteral.test(part.text),
+    )
+  )
+    return undefined;
+  return [
+    BigInt((ts[0] as JsonNumber).text),
+    BigInt((ts[1] as JsonNumber).text),
+  ];
 }
 
 function decodeMessage(
   model: ResolvedModel,
   message: TopicMessage,
 ): YdbChangeEvent {
-  const raw = JSON.parse(
-    new TextDecoder().decode(message.payload),
-  ) as JsonValue;
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+  const tokens = parseTokens(new TextDecoder().decode(message.payload));
+  if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens))
     throw new TypeError('Changefeed record is not an object');
-  const record = raw as Record<string, JsonValue>;
-  const ts = record['ts'];
-  const key = decodeKey(model, record['key'] ?? null);
+  const record = tokens as Record<string, Token>;
+  const key = decodeKey(model, record['key']);
   // Images carry non-key columns only; merge the key so they read as full rows.
-  const image = (name: string) =>
-    name in record && record[name] !== null
-      ? { ...key, ...decodeImage(model, record[name] ?? {}) }
-      : undefined;
+  const image = (name: string) => {
+    const value = record[name];
+    return value === undefined || value === null
+      ? undefined
+      : { ...key, ...decodeImage(model, value) };
+  };
   const newImage = image('newImage');
   const oldImage = image('oldImage');
+  const updates = record['update'];
+  const ts = virtualTimestamp(record['ts']);
+  const session = message.partitionSession.deref();
   return {
     kind: 'erase' in record ? 'erase' : 'update',
     key,
-    ...('update' in record && record['update'] !== null
-      ? { updates: decodeImage(model, record['update'] ?? {}) }
+    ...(updates !== undefined && updates !== null
+      ? { updates: decodeImage(model, updates) }
       : {}),
     ...(newImage ? { newImage } : {}),
     ...(oldImage ? { oldImage } : {}),
-    ...(Array.isArray(ts) && ts.length === 2
-      ? { ts: [BigInt(ts[0] as number), BigInt(ts[1] as number)] as const }
-      : {}),
+    ...(ts ? { ts } : {}),
     offset: message.offset,
-    partition: message.partitionSession.deref()?.partitionId,
+    partition: session?.partitionId,
+    partitionSessionId: session?.partitionSessionId,
     seqNo: message.seqNo,
     writtenAt:
       message.writtenAt === undefined ? undefined : new Date(message.writtenAt),
-    raw,
+    raw: rawJson(tokens),
+  };
+}
+
+type TopicPartitionSession = Parameters<
+  NonNullable<TopicReaderOptions['onPartitionSessionStop']>
+>[0];
+
+function partitionOf(
+  session: TopicPartitionSession,
+  committedOffset: bigint,
+): YdbChangefeedPartition {
+  return {
+    partitionId: session.partitionId,
+    partitionSessionId: session.partitionSessionId,
+    committedOffset,
+    startOffset: session.partitionOffsets?.start ?? 0n,
+    endOffset: session.partitionOffsets?.end ?? 0n,
   };
 }
 
@@ -171,6 +340,13 @@ export async function* readChangefeed(
   const core = driver.core;
   const controller = new AbortController();
   const abort = () => controller.abort();
+  // The SDK swallows hook exceptions; end the iteration with them instead.
+  let hookFailure: { error: unknown } | undefined;
+  const fail = (error: unknown) => {
+    hookFailure ??= { error };
+    controller.abort(error);
+  };
+  const { onPartitionStart, onPartitionStop, onCommitted } = options;
   for (const signal of [options.signal, shutdown]) {
     if (!signal) continue;
     if (signal.aborted) abort();
@@ -189,6 +365,54 @@ export async function* readChangefeed(
     ...(options.maxBufferBytes !== undefined
       ? { maxBufferBytes: options.maxBufferBytes }
       : {}),
+    ...(onPartitionStart
+      ? {
+          async onPartitionSessionStart(session, committedOffset, offsets) {
+            try {
+              const position = await onPartitionStart({
+                partitionId: session.partitionId,
+                partitionSessionId: session.partitionSessionId,
+                committedOffset,
+                startOffset: offsets.start,
+                endOffset: offsets.end,
+              });
+              if (!position) return undefined;
+              // The SDK sends 0 for an omitted field, which would reset the
+              // consumer; fill both from the server's current positions.
+              const commitOffset = position.commitOffset ?? committedOffset;
+              return {
+                readOffset: position.readOffset ?? commitOffset,
+                commitOffset,
+              };
+            } catch (error) {
+              fail(error);
+              return undefined;
+            }
+          },
+        }
+      : {}),
+    ...(onPartitionStop
+      ? {
+          async onPartitionSessionStop(session, committedOffset) {
+            try {
+              await onPartitionStop(partitionOf(session, committedOffset));
+            } catch (error) {
+              fail(error);
+            }
+          },
+        }
+      : {}),
+    ...(onCommitted
+      ? {
+          onCommittedOffset(session, committedOffset) {
+            try {
+              onCommitted(partitionOf(session, committedOffset));
+            } catch (error) {
+              fail(error);
+            }
+          },
+        }
+      : {}),
   });
   try {
     // One read() call ends after `limit` messages; keep reading until aborted.
@@ -200,9 +424,19 @@ export async function* readChangefeed(
       })) {
         if (!messages.length) continue;
         const events = messages.map((message) => decodeMessage(model, message));
-        yield { events, commit: () => reader.commit(messages) };
+        yield {
+          events,
+          // The SDK rejects commits of a stopped partition with a bare string.
+          commit: () =>
+            reader.commit(messages).catch((reason: unknown) => {
+              throw reason instanceof Error
+                ? reason
+                : new Error(`YDB changefeed commit failed: ${String(reason)}`);
+            }),
+        };
       }
     }
+    if (hookFailure) throw hookFailure.error;
   } finally {
     for (const signal of [options.signal, shutdown])
       signal?.removeEventListener('abort', abort);
