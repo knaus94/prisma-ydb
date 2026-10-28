@@ -1,3 +1,6 @@
+import { create } from '@bufbuild/protobuf';
+import { ValueSchema, type Value as WireValue } from '@ydbjs/api/value';
+import { bigIntsFromUuid } from '@ydbjs/value/uuid';
 import {
   CodecDescriptorImpl,
   CodecImpl,
@@ -28,8 +31,10 @@ import { ydbJsonForm } from '../driver/json-form.js';
 export { ydbJsonForm } from '../driver/json-form.js';
 import {
   dateText,
+  isCanonicalYdbTimestamp,
   timestampText,
   timestampFromMicros,
+  timestampMicros,
   TimestampMicrosValue,
 } from './temporal.js';
 
@@ -110,6 +115,20 @@ export class YdbCodecDescriptor<
   fromJson(value: JsonValue): T {
     return this.conversion.fromJson(value);
   }
+  /** Resolve conversions once for native model row loops. */
+  nativeConversions(): NativeCodecConversions {
+    const conversion = this.conversion;
+    const decode = conversion.decode ?? conversion.read;
+    return {
+      decode: (value) =>
+        value instanceof YdbJsonElement
+          ? conversion.fromJson(value.value)
+          : decode(value),
+      encode: nativeWireEncoder(this.codecId, conversion.read),
+      encodeJson: (value) => conversion.json(conversion.read(value)),
+      decodeJson: conversion.fromJson,
+    };
+  }
 }
 
 function assertString(value: unknown): string {
@@ -170,6 +189,7 @@ function assertDate(value: unknown): Date {
 }
 function timestampJson(value: JsonValue): Date {
   const text = assertString(value);
+  if (isCanonicalYdbTimestamp(text)) return new Date(text);
   const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$/.exec(
     text,
   );
@@ -636,4 +656,125 @@ export function encodeYdbJson(
   const codec = jsonCodecsById.get(codecId);
   if (!codec) throw new TypeError(`YDB codec not registered: ${codecId}`);
   return codec.encodeJson(value as never);
+}
+
+interface NativeCodecConversions {
+  readonly decode: (value: unknown) => unknown;
+  readonly encode: (value: unknown) => WireValue;
+  readonly encodeJson: (value: unknown) => JsonValue;
+  readonly decodeJson: (value: JsonValue) => unknown;
+}
+
+/** Precompile the protobuf cell encoder; read preserves the codec's input checks. */
+function nativeWireEncoder(
+  codecId: string,
+  read: (value: unknown) => unknown,
+): (value: unknown) => WireValue {
+  switch (codecId) {
+    case 'ydb/utf8@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'textValue', value: read(value) as string },
+        });
+    case 'ydb/uuid@1':
+      return (value) => {
+        const { low128, high128 } = bigIntsFromUuid(read(value) as string);
+        return create(ValueSchema, {
+          value: { case: 'low128', value: low128 },
+          high128,
+        });
+      };
+    case 'ydb/int32@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'int32Value', value: read(value) as number },
+        });
+    case 'ydb/int64@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'int64Value', value: read(value) as bigint },
+        });
+    case 'ydb/uint64@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'uint64Value', value: read(value) as bigint },
+        });
+    case 'ydb/number@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'int64Value', value: BigInt(read(value) as number) },
+        });
+    case 'ydb/bool@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'boolValue', value: read(value) as boolean },
+        });
+    case 'ydb/double@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'doubleValue', value: read(value) as number },
+        });
+    case 'ydb/string@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'bytesValue', value: read(value) as Uint8Array },
+        });
+    case 'ydb/json@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'textValue', value: JSON.stringify(read(value)) },
+        });
+    case 'ydb/date@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: {
+            case: 'uint32Value',
+            value:
+              new Date(`${read(value)}T00:00:00.000Z`).getTime() / 86400000,
+          },
+        });
+    case 'ydb/timestamp@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: {
+            case: 'uint64Value',
+            value: BigInt((read(value) as Date).getTime()) * 1000n,
+          },
+        });
+    case 'ydb/timestamp-us@1':
+      return (value) =>
+        create(ValueSchema, {
+          value: { case: 'uint64Value', value: timestampMicros(read(value)) },
+        });
+    default:
+      throw new TypeError(`YDB codec not registered: ${codecId}`);
+  }
+}
+
+/** Synchronous native conversions with the same decoder as YdbCodec.decode. */
+export function nativeCodecConversions(
+  codecId: string,
+  typeParams?: unknown,
+): NativeCodecConversions {
+  if (codecId === ydbDecimal.codecId) {
+    const { precision, scale } = decimalParams(typeParams);
+    const read = (value: unknown) => decimalText(value, precision, scale);
+    return {
+      decode: (value) =>
+        read(value instanceof YdbJsonElement ? value.value : value),
+      encode: (value) => {
+        const bits = BigInt.asUintN(128, BigInt(read(value).replace('.', '')));
+        return create(ValueSchema, {
+          value: { case: 'low128', value: bits & ((1n << 64n) - 1n) },
+          high128: bits >> 64n,
+        });
+      },
+      encodeJson: read,
+      decodeJson: read,
+    };
+  }
+  const codec = codecsById.get(codecId);
+  if (!codec || !(codec instanceof YdbCodecDescriptor))
+    throw new TypeError(`YDB codec not registered: ${codecId}`);
+  return codec.nativeConversions();
 }

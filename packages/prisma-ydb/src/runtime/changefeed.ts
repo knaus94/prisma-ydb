@@ -20,6 +20,8 @@ export interface YdbChangefeedPartition {
   /** Offsets currently retained in the partition, `end` exclusive. */
   readonly startOffset: bigint;
   readonly endOffset: bigint;
+  /** The consumer fell behind the earliest retained offset. */
+  readonly retentionExpired: boolean;
 }
 
 /** Positions to start an assigned partition from; omitted fields keep the server's. */
@@ -90,9 +92,27 @@ export interface YdbChangeEvent<Row = Record<string, unknown>> {
   readonly raw: JsonValue;
 }
 
+export interface YdbChangefeedDecodeError {
+  readonly partitionId: bigint;
+  readonly partitionSessionId: bigint;
+  readonly offset: bigint | undefined;
+  readonly error: unknown;
+  readonly payload: Uint8Array;
+}
+
+export interface YdbChangePartitionBatch<Row = Record<string, unknown>> {
+  readonly partitionId: bigint;
+  readonly partitionSessionId: bigint;
+  readonly events: readonly YdbChangeEvent<Row>[];
+  readonly errors: readonly YdbChangefeedDecodeError[];
+  /** Acknowledge successfully decoded records before any decode failure. */
+  commit(): Promise<void>;
+}
+
 export interface YdbChangeBatch<Row = Record<string, unknown>> {
   readonly events: readonly YdbChangeEvent<Row>[];
-  /** Acknowledge the batch; the consumer resumes after it on restart. */
+  readonly partitions: readonly YdbChangePartitionBatch<Row>[];
+  /** Acknowledge partitions without decode errors in this batch. */
   commit(): Promise<void>;
 }
 
@@ -108,6 +128,7 @@ type Token =
   | null
   | boolean
   | string
+  | number
   | JsonNumber
   | Token[]
   | { [key: string]: Token };
@@ -118,7 +139,19 @@ const losslessJson =
     typeof value === 'number' ? context?.source : value,
   ) === '1';
 
+const textDecoder = new TextDecoder();
+const longDigits = /\d{16,}/;
+// Source-sensitive fractional/exponent numbers stay on the reviver path.
+// Matches inside strings only cause a conservative fallback.
+const nonIntegerNumber =
+  /(?:^|[[:,])\s*-?\d+(?:\.\d+(?:[eE][+-]?\d+)?|[eE][+-]?\d+)\s*(?=[,}\]]|$)/;
+
+function ordinaryIntegers(text: string): boolean {
+  return !longDigits.test(text) && !nonIntegerNumber.test(text);
+}
+
 function parseTokens(text: string): Token {
+  if (ordinaryIntegers(text)) return JSON.parse(text) as Token;
   if (!losslessJson)
     throw new Error(
       'db.changefeed needs JSON.parse source text access (Node 24+) to decode 64-bit integers exactly',
@@ -173,6 +206,8 @@ const cdcDate = /^(\d{4}-\d{2}-\d{2})T00:00:00(?:\.0+)?Z$/;
 function codecJson(codecId: string, token: Token): JsonValue {
   if (token instanceof JsonNumber)
     return textNumberCodecs.has(codecId) ? token.text : Number(token.text);
+  if (typeof token === 'number')
+    return textNumberCodecs.has(codecId) ? String(token) : token;
   if (codecId === 'ydb/json@1')
     return typeof token === 'string'
       ? (JSON.parse(token) as JsonValue)
@@ -215,7 +250,9 @@ function decodeImage(
   if (typeof image !== 'object' || image === null || Array.isArray(image))
     throw new TypeError('Changefeed image is not an object');
   const row: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(image)) {
+  for (const name in image) {
+    if (!Object.hasOwn(image, name)) continue;
+    const value = (image as { [key: string]: Token })[name]!;
     const column = model.byColumn.get(name);
     if (column) row[column.field] = decodeField(column, value);
   }
@@ -241,22 +278,40 @@ function virtualTimestamp(
   if (
     !Array.isArray(ts) ||
     ts.length !== 2 ||
-    !ts.every(
-      (part) => part instanceof JsonNumber && integerLiteral.test(part.text),
+    !ts.every((part) =>
+      typeof part === 'number'
+        ? Number.isSafeInteger(part)
+        : part instanceof JsonNumber && integerLiteral.test(part.text),
     )
   )
     return undefined;
   return [
-    BigInt((ts[0] as JsonNumber).text),
-    BigInt((ts[1] as JsonNumber).text),
+    BigInt(typeof ts[0] === 'number' ? ts[0] : (ts[0] as JsonNumber).text),
+    BigInt(typeof ts[1] === 'number' ? ts[1] : (ts[1] as JsonNumber).text),
   ];
 }
+
+// Share the accessor so event objects keep one shape; cache raw on first access.
+const rawTokens = Symbol('changefeed tokens');
+const rawDescriptor: PropertyDescriptor = {
+  enumerable: true,
+  configurable: true,
+  get(this: { [rawTokens]: Token }): JsonValue {
+    const value = rawJson(this[rawTokens]);
+    Object.defineProperty(this, 'raw', {
+      value,
+      enumerable: true,
+      configurable: true,
+    });
+    return value;
+  },
+};
 
 function decodeMessage(
   model: ResolvedModel,
   message: TopicMessage,
 ): YdbChangeEvent {
-  const tokens = parseTokens(new TextDecoder().decode(message.payload));
+  const tokens = parseTokens(textDecoder.decode(message.payload));
   if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens))
     throw new TypeError('Changefeed record is not an object');
   const record = tokens as Record<string, Token>;
@@ -273,7 +328,7 @@ function decodeMessage(
   const updates = record['update'];
   const ts = virtualTimestamp(record['ts']);
   const session = message.partitionSession.deref();
-  return {
+  const event = {
     kind: 'erase' in record ? 'erase' : 'update',
     key,
     ...(updates !== undefined && updates !== null
@@ -288,8 +343,9 @@ function decodeMessage(
     seqNo: message.seqNo,
     writtenAt:
       message.writtenAt === undefined ? undefined : new Date(message.writtenAt),
-    raw: rawJson(tokens),
   };
+  Object.defineProperty(event, rawTokens, { value: tokens });
+  return Object.defineProperty(event, 'raw', rawDescriptor) as YdbChangeEvent;
 }
 
 type TopicPartitionSession = Parameters<
@@ -306,6 +362,7 @@ function partitionOf(
     committedOffset,
     startOffset: session.partitionOffsets?.start ?? 0n,
     endOffset: session.partitionOffsets?.end ?? 0n,
+    retentionExpired: committedOffset < (session.partitionOffsets?.start ?? 0n),
   };
 }
 
@@ -347,6 +404,9 @@ export async function* readChangefeed(
     controller.abort(error);
   };
   const { onPartitionStart, onPartitionStop, onCommitted } = options;
+  // The SDK has no reader API to pause one partition. Drain quarantined
+  // messages without decoding or committing them; reassignment replays them.
+  const quarantined = new Map<bigint, bigint | undefined>();
   for (const signal of [options.signal, shutdown]) {
     if (!signal) continue;
     if (signal.aborted) abort();
@@ -365,43 +425,39 @@ export async function* readChangefeed(
     ...(options.maxBufferBytes !== undefined
       ? { maxBufferBytes: options.maxBufferBytes }
       : {}),
-    ...(onPartitionStart
-      ? {
-          async onPartitionSessionStart(session, committedOffset, offsets) {
-            try {
-              const position = await onPartitionStart({
-                partitionId: session.partitionId,
-                partitionSessionId: session.partitionSessionId,
-                committedOffset,
-                startOffset: offsets.start,
-                endOffset: offsets.end,
-              });
-              if (!position) return undefined;
-              // The SDK sends 0 for an omitted field, which would reset the
-              // consumer; fill both from the server's current positions.
-              const commitOffset = position.commitOffset ?? committedOffset;
-              return {
-                readOffset: position.readOffset ?? commitOffset,
-                commitOffset,
-              };
-            } catch (error) {
-              fail(error);
-              return undefined;
-            }
-          },
-        }
-      : {}),
-    ...(onPartitionStop
-      ? {
-          async onPartitionSessionStop(session, committedOffset) {
-            try {
-              await onPartitionStop(partitionOf(session, committedOffset));
-            } catch (error) {
-              fail(error);
-            }
-          },
-        }
-      : {}),
+    async onPartitionSessionStart(session, committedOffset, offsets) {
+      quarantined.delete(session.partitionSessionId);
+      try {
+        const position = await onPartitionStart?.({
+          partitionId: session.partitionId,
+          partitionSessionId: session.partitionSessionId,
+          committedOffset,
+          startOffset: offsets.start,
+          endOffset: offsets.end,
+          retentionExpired: committedOffset < offsets.start,
+        });
+        if (!position) return undefined;
+        // The SDK sends 0 for an omitted field, which would reset the
+        // consumer; fill both from the server's current positions.
+        const commitOffset = position.commitOffset ?? committedOffset;
+        session.nextCommitStartOffset = commitOffset;
+        return {
+          readOffset: position.readOffset ?? commitOffset,
+          commitOffset,
+        };
+      } catch (error) {
+        fail(error);
+        return undefined;
+      }
+    },
+    async onPartitionSessionStop(session, committedOffset) {
+      quarantined.delete(session.partitionSessionId);
+      try {
+        await onPartitionStop?.(partitionOf(session, committedOffset));
+      } catch (error) {
+        fail(error);
+      }
+    },
     ...(onCommitted
       ? {
           onCommittedOffset(session, committedOffset) {
@@ -423,16 +479,96 @@ export async function* readChangefeed(
         signal: controller.signal,
       })) {
         if (!messages.length) continue;
-        const events = messages.map((message) => decodeMessage(model, message));
+        const events: YdbChangeEvent[] = [];
+        const groups = new Map<
+          bigint,
+          {
+            partitionId: bigint;
+            partitionSessionId: bigint;
+            events: YdbChangeEvent[];
+            errors: YdbChangefeedDecodeError[];
+            messages: TopicMessage[];
+          }
+        >();
+        for (const message of messages) {
+          const session = message.partitionSession.deref();
+          if (
+            !session ||
+            session.isStopped ||
+            quarantined.has(session.partitionSessionId)
+          )
+            continue;
+          let group = groups.get(session.partitionSessionId);
+          if (!group) {
+            group = {
+              partitionId: session.partitionId,
+              partitionSessionId: session.partitionSessionId,
+              events: [],
+              errors: [],
+              messages: [],
+            };
+            groups.set(session.partitionSessionId, group);
+          }
+          try {
+            const event = decodeMessage(model, message);
+            events.push(event);
+            group.events.push(event);
+            group.messages.push(message);
+          } catch (error) {
+            quarantined.set(session.partitionSessionId, message.offset);
+            group.errors.push({
+              partitionId: session.partitionId,
+              partitionSessionId: session.partitionSessionId,
+              offset: message.offset,
+              error,
+              payload: message.payload,
+            });
+          }
+        }
+        if (!groups.size) continue;
+        const partitions = [...groups.values()].map((group) => {
+          let committed: Promise<void> | undefined;
+          return {
+            partitionId: group.partitionId,
+            partitionSessionId: group.partitionSessionId,
+            events: group.events,
+            errors: group.errors,
+            commit: () =>
+              (committed ??= (async () => {
+                const badOffset = quarantined.get(group.partitionSessionId);
+                const safe = quarantined.has(group.partitionSessionId)
+                  ? group.messages.filter(
+                      (message) =>
+                        badOffset !== undefined &&
+                        message.offset !== undefined &&
+                        message.offset < badOffset,
+                    )
+                  : group.messages;
+                if (!safe.length) return;
+                try {
+                  await reader.commit(safe);
+                } catch (reason) {
+                  throw reason instanceof Error
+                    ? reason
+                    : new Error(
+                        `YDB changefeed commit failed: ${String(reason)}`,
+                      );
+                }
+              })()),
+          };
+        });
         yield {
           events,
-          // The SDK rejects commits of a stopped partition with a bare string.
-          commit: () =>
-            reader.commit(messages).catch((reason: unknown) => {
-              throw reason instanceof Error
-                ? reason
-                : new Error(`YDB changefeed commit failed: ${String(reason)}`);
-            }),
+          partitions,
+          commit: async () => {
+            // Commit separately: the SDK's multi-partition promise resolves
+            // after the first partition acknowledgement, rather than all of them.
+            await Promise.all(
+              partitions
+                .filter((part) => !part.errors.length)
+                .map((part) => part.commit()),
+            );
+          },
         };
       }
     }

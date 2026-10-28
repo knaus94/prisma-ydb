@@ -92,6 +92,80 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
   });
 
   await context.test(
+    'commitWith commits the final ORM statement without a commit RPC',
+    async () => {
+      operations();
+      const before = db.stats().paths.held;
+      const result = await db.transaction(async (tx) => {
+        await tx.orm.Account.where({ id: 'a' }).first();
+        const updated = await tx.commitWith(() =>
+          tx.orm.Account.where({ id: 'a' }).updateAll({ balance: 4 }),
+        );
+        assert.equal(tx.invalidated, true);
+        return updated;
+      });
+      assert.ok(result);
+      assert.deepEqual(operations(), ['begin', 'query', 'query']);
+      const after = db.stats().paths.held;
+      assert.equal(after.active, 0);
+      assert.equal(after.total - before.total, 1);
+      assert.equal(after.errors, before.errors);
+      assert.equal(
+        (await db.orm.Account.where({ id: 'a' }).first())?.balance,
+        4,
+      );
+    },
+  );
+
+  await context.test(
+    'commitWith preserves atomic ORM mutation scopes',
+    async () => {
+      operations();
+      await db.transaction(async (tx) => {
+        const updated = await tx.commitWith(() =>
+          tx.orm.Account.where({ id: 'a' }).update({ balance: 40 }),
+        );
+        assert.equal(updated?.balance, 40);
+        assert.equal(tx.invalidated, true);
+      });
+      const emitted = operations();
+      assert.equal(emitted.at(-1), 'commit');
+      assert.ok(emitted.filter((event) => event === 'query').length >= 1);
+      assert.equal(
+        (await db.orm.Account.where({ id: 'a' }).first())?.balance,
+        40,
+      );
+    },
+  );
+
+  await context.test(
+    'commitWith rejects zero or multiple statements',
+    async () => {
+      operations();
+      await assert.rejects(
+        db.transaction(async (tx) => tx.commitWith(() => undefined)),
+        /at least one statement/,
+      );
+      assert.deepEqual(operations(), ['begin', 'rollback']);
+      await assert.rejects(
+        db.transaction(async (tx) =>
+          tx.commitWith(async () => {
+            await tx.orm.Account.where({ id: 'a' }).updateAll({ balance: 5 });
+            await tx.orm.Account.where({ id: 'a' }).updateAll({ balance: 6 });
+          }),
+        ),
+        /already been committed|exactly one/,
+      );
+      // The first statement carried the commit; rejecting later work cannot undo it.
+      assert.deepEqual(operations(), ['begin', 'query']);
+      assert.equal(
+        (await db.orm.Account.where({ id: 'a' }).first())?.balance,
+        5,
+      );
+    },
+  );
+
+  await context.test(
     'held sessions are capped while autocommit statements proceed',
     async () => {
       let releaseFirst!: () => void;
@@ -107,6 +181,7 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
       try {
         await started;
         assert.equal(db.stats().held, 1);
+        assert.equal(db.stats().paths.held.active, 1);
         let secondStarted = false;
         second = db.transaction(async (tx) => {
           secondStarted = true;
@@ -126,6 +201,8 @@ test('interactive transactions: lazy begin, read-only mode, statement commit and
       await first;
       assert.equal((await second!).length, 1);
       assert.equal(db.stats().held, 0);
+      assert.equal(db.stats().paths.held.active, 0);
+      assert.ok(db.stats().paths.held.errors >= 1);
     },
   );
 });

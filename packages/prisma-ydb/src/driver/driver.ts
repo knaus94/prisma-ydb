@@ -59,6 +59,12 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
   /** Bounds leases handed out through acquireConnection(); statements bypass it. */
   readonly #holding: Semaphore;
   #held = 0;
+  readonly #paths = {
+    autocommit: { active: 0, total: 0, errors: 0 },
+    streaming: { active: 0, total: 0, errors: 0, abandoned: 0 },
+    bulkUpsert: { active: 0, total: 0, errors: 0 },
+    held: { active: 0, total: 0, errors: 0 },
+  };
   #tables:
     | ReturnType<
         typeof Driver.prototype.createClient<typeof TableServiceDefinition>
@@ -86,6 +92,12 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
 
   get stats(): YdbPoolStats {
     return {
+      paths: {
+        autocommit: { ...this.#paths.autocommit },
+        streaming: { ...this.#paths.streaming },
+        bulkUpsert: { ...this.#paths.bulkUpsert },
+        held: { ...this.#paths.held },
+      },
       maxSessions: this.config.maxSessions,
       idle: this.#idle.length,
       leased: this.#leased.size,
@@ -222,8 +234,11 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
     requestSignal: AbortSignal | undefined,
     held: boolean,
   ): Promise<YdbConnection> {
-    if (this.#state !== 'connected' || this.#closing)
+    if (held) this.#paths.held.total++;
+    if (this.#state !== 'connected' || this.#closing) {
+      if (held) this.#paths.held.errors++;
       throw new SqlConnectionError('YDB driver is not connected or is closing');
+    }
     const started = performance.now();
     const scope = deadline(this.config.acquireTimeoutMs, requestSignal);
     let hold: (() => void) | undefined;
@@ -243,7 +258,11 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
       const unhold = hold;
       const connection = new YdbConnection(session, this, (reusable) => {
         this.#leased.delete(connection);
-        if (unhold) this.#held--;
+        if (unhold) {
+          this.#held--;
+          this.#paths.held.active--;
+          if (connection.failed || !reusable) this.#paths.held.errors++;
+        }
         if (reusable && this.#fresh(session) && !this.#closing) {
           session.idleSince = Date.now();
           this.#idle.push(session);
@@ -253,9 +272,13 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         this.#notifyDrain();
       });
       this.#leased.add(connection);
-      if (unhold) this.#held++;
+      if (unhold) {
+        this.#held++;
+        this.#paths.held.active++;
+      }
       return connection;
     } catch (error) {
+      if (held) this.#paths.held.errors++;
       release?.();
       hold?.();
       failure = normalizeError(
@@ -278,9 +301,14 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
    * request deadline. Nothing is replayed once a part has been yielded.
    */
   async *queryYql(request: YdbQueryRequest): AsyncIterable<YdbQueryPart> {
-    const run = this.#plan(request);
+    const stats = this.#paths.streaming;
+    stats.active++;
+    stats.total++;
+    let run: Run | undefined;
+    let complete = false;
     let yielded = false;
     try {
+      run = this.#plan(request);
       for (let attempts = 1; ; attempts++) {
         let connection: YdbConnection | undefined;
         let failure: unknown;
@@ -291,6 +319,7 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
             yielded = true;
             yield part;
           }
+          complete = true;
           return;
         } catch (error) {
           failure = error;
@@ -299,15 +328,25 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         }
         await run.backoff(failure, attempts, yielded);
       }
+    } catch (error) {
+      stats.errors++;
+      complete = true;
+      throw error;
     } finally {
-      run.scope.dispose();
+      stats.active--;
+      if (!complete) stats.abandoned++;
+      run?.scope.dispose();
     }
   }
 
   /** Buffered execution with the same lease/retry policy as queryYql. */
   async executeYql(request: YdbQueryRequest): Promise<YdbQueryResult> {
-    const run = this.#plan(request);
+    const stats = this.#paths.autocommit;
+    stats.active++;
+    stats.total++;
+    let run: Run | undefined;
     try {
+      run = this.#plan(request);
       for (let attempts = 1; ; attempts++) {
         let connection: YdbConnection | undefined;
         let failure: unknown;
@@ -322,8 +361,12 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         }
         await run.backoff(failure, attempts, false);
       }
+    } catch (error) {
+      stats.errors++;
+      throw error;
     } finally {
-      run.scope.dispose();
+      stats.active--;
+      run?.scope.dispose();
     }
   }
 
@@ -361,20 +404,24 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
 
   /** TableService BulkUpsert: idempotent, outside any transaction, retried like a read. */
   async bulkUpsert(request: YdbBulkUpsertRequest): Promise<void> {
-    const rows = encodeParameters({ rows: request.rows })['$rows'];
-    const table = request.table.startsWith('/')
-      ? request.table
-      : `${this.core.database}/${request.table}`;
-    const run = this.#plan({
-      text: '',
-      signal: request.signal,
-      timeoutMs: request.timeoutMs,
-      idempotent: true,
-      retry: request.retry,
-    });
+    const stats = this.#paths.bulkUpsert;
+    stats.active++;
+    stats.total++;
+    let run: Run | undefined;
     const started = performance.now();
     let failure: unknown;
     try {
+      const rows = encodeParameters({ rows: request.rows })['$rows'];
+      const table = request.table.startsWith('/')
+        ? request.table
+        : `${this.core.database}/${request.table}`;
+      run = this.#plan({
+        text: '',
+        signal: request.signal,
+        timeoutMs: request.timeoutMs,
+        idempotent: true,
+        retry: request.retry,
+      });
       for (let attempts = 1; ; attempts++) {
         try {
           run.scope.signal.throwIfAborted();
@@ -397,10 +444,12 @@ export class YdbDriver implements SqlDriver<YdbBinding> {
         failure = undefined;
       }
     } catch (error) {
+      stats.errors++;
       failure = error;
       throw error;
     } finally {
-      run.scope.dispose();
+      stats.active--;
+      run?.scope.dispose();
       emit(this, 'bulk-upsert', started, failure);
     }
   }

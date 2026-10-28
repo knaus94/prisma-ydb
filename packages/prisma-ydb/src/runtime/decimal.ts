@@ -29,6 +29,21 @@ export function decimalText(
       'Decimal requires a finite decimal string without exponent notation',
     );
   const negative = value.startsWith('-');
+  const start = negative ? 1 : 0;
+  const point = value.indexOf('.');
+  const integerEnd = point === -1 ? value.length : point;
+  const zeroInteger = value.charCodeAt(start) === 48;
+  // Canonical fixed-scale values need neither BigInt parsing nor formatting.
+  if (
+    value.charCodeAt(value.length - 1) >= 48 &&
+    value.charCodeAt(value.length - 1) <= 57 &&
+    (scale === 0
+      ? point === -1
+      : point > start && point === value.length - scale - 1) &&
+    (!zeroInteger || integerEnd === start + 1) &&
+    integerEnd - start - (zeroInteger ? 1 : 0) + scale <= precision
+  )
+    return negative && !/[1-9]/.test(value) ? value.slice(1) : value;
   const [integer, fraction = ''] = (negative ? value.slice(1) : value).split(
     '.',
   );

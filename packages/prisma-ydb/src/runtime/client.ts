@@ -74,6 +74,14 @@ import {
   type YdbChangefeedOptions,
 } from './changefeed.js';
 import { YdbJsonElement } from './codecs.js';
+import { topicClient } from './topic.js';
+import {
+  yqlModel,
+  type YdbModelName,
+  type YdbYqlInput,
+  type YdbYqlOutput,
+  type YdbYqlModel,
+} from './yql-model.js';
 import {
   createYdbRuntimeAdapter,
   readYdbRuntimeMarker,
@@ -124,6 +132,8 @@ export interface YdbTransactionContext<
 > extends YdbQueryMembers<C> {
   readonly invalidated: boolean;
   readonly signal: AbortSignal;
+  /** Commit with a direct statement, or normally after an atomic ORM mutation graph. */
+  commitWith<T>(callback: () => T | PromiseLike<T>): Promise<T>;
 }
 export interface YdbTransactionOptions {
   readonly retry?: boolean | { readonly maxAttempts?: number };
@@ -141,6 +151,23 @@ export interface YdbClient<C extends Contract<SqlStorage>>
 interface YdbClientLifecycle<C extends Contract<SqlStorage>> {
   readonly contract: C;
   readonly context: ExecutionContext<C>;
+  /** Contract-derived native YQL declarations, parameters and result decoding. */
+  yqlModel<
+    Name extends YdbModelName<C>,
+    const Field extends keyof YdbYqlInput<C, Name> &
+      keyof YdbYqlOutput<C, Name> &
+      string = keyof YdbYqlInput<C, Name> &
+      keyof YdbYqlOutput<C, Name> &
+      string,
+  >(
+    name: Name,
+    options?: { readonly fields?: readonly Field[] },
+  ): YdbYqlModel<
+    Pick<YdbYqlInput<C, Name>, Field>,
+    Pick<YdbYqlOutput<C, Name>, Field>
+  >;
+  /** Topic API sharing this client's connected SDK driver; connect first. */
+  topic(): ReturnType<typeof topicClient>;
   /**
    * The same ORM/SQL/raw lanes streaming rows as the server sends them, without
    * the buffered result bounds. Abandoning an iterator early cancels the RPC
@@ -375,6 +402,7 @@ export function ydb<C extends Contract<SqlStorage>>(
     native: { executeYql(request: YdbQueryRequest): Promise<YdbQueryResult> },
     checkActive: () => void = () => undefined,
     failMutationScope?: () => void,
+    trackMutationScope?: (active: boolean) => void,
   ): YdbQueryMembers<C> => {
     let sql: Db<C> | undefined;
     let raw: RawLane<C> | undefined;
@@ -408,14 +436,23 @@ export function ydb<C extends Contract<SqlStorage>>(
             ? {
                 transaction: async () => {
                   checkActive();
+                  trackMutationScope?.(true);
+                  let active = true;
+                  const finish = () => {
+                    if (!active) return;
+                    active = false;
+                    trackMutationScope?.(false);
+                  };
                   // A nested mutation graph joins the held transaction. YDB has no
                   // savepoints, so graph failure invalidates the whole transaction.
                   return {
                     ...scoped,
                     commit: async () => {
+                      finish();
                       checkActive();
                     },
                     rollback: async () => {
+                      finish();
                       failMutationScope();
                     },
                   };
@@ -517,6 +554,14 @@ export function ydb<C extends Contract<SqlStorage>>(
   const lifecycle: YdbClientLifecycle<C> = {
     contract,
     context,
+    yqlModel(name, modelOptions) {
+      checkClosed();
+      return yqlModel(contract, name, modelOptions);
+    },
+    topic() {
+      checkClosed();
+      return topicClient(nativeDriver);
+    },
     async connect(nextBinding) {
       if (nextBinding) {
         if (connection) throw new Error('YDB client already connected');
@@ -688,24 +733,52 @@ export function ydb<C extends Contract<SqlStorage>>(
     let lastScopedFailure: unknown;
     const controller = new AbortController();
     let callbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let commitScope: { statements: number; failure?: Error } | undefined;
+    let mutationScopes = 0;
     try {
       transaction = await acquired.beginTransaction({ mode });
       const checkActive = () => {
-        if (settled) throw new Error('YDB transaction is already settled');
+        if (settled || transaction?.committed) {
+          const error = new Error(
+            settled
+              ? 'YDB transaction is already settled'
+              : 'YDB transaction has already been committed by a statement',
+          );
+          if (commitScope) commitScope.failure = error;
+          throw error;
+        }
       };
       const queryable = transaction;
+      const statementCommit = () => {
+        if (!commitScope) return false;
+        commitScope.statements++;
+        // Mutation graphs must finish atomically, including probes and dependent writes.
+        if (mutationScopes) return false;
+        if (commitScope.statements !== 1) {
+          commitScope.failure = new Error(
+            'commitWith requires exactly one statement',
+          );
+          throw commitScope.failure;
+        }
+        return true;
+      };
       const scopedDriver: SqlDriver<unknown> = {
         connect: async () => {
           checkActive();
         },
         async *query<Row>(request: SqlExecuteRequest) {
+          const commit = statementCommit();
           checkActive();
           const linked = linkSignals(
             controller.signal,
             (request as SqlExecuteRequest & { signal?: AbortSignal }).signal,
           );
           try {
-            yield* queryable.query<Row>({ ...request, signal: linked.signal });
+            yield* queryable.query<Row>({
+              ...request,
+              signal: linked.signal,
+              commit,
+            });
           } catch (error) {
             lastScopedFailure = error;
             throw error;
@@ -714,6 +787,7 @@ export function ydb<C extends Contract<SqlStorage>>(
           }
         },
         async execute(request) {
+          const commit = statementCommit();
           checkActive();
           const linked = linkSignals(
             controller.signal,
@@ -723,6 +797,7 @@ export function ydb<C extends Contract<SqlStorage>>(
             return await queryable.execute({
               ...request,
               signal: linked.signal,
+              commit,
             });
           } catch (error) {
             lastScopedFailure = error;
@@ -754,11 +829,16 @@ export function ydb<C extends Contract<SqlStorage>>(
       };
       const scopedNative = {
         async executeYql(request: YdbQueryRequest) {
+          const directCommit = statementCommit();
+          const commit = mutationScopes
+            ? false
+            : directCommit || request.commit;
           const linked = linkSignals(controller.signal, request.signal);
           try {
             return await queryable.executeYql({
               ...request,
               signal: linked.signal,
+              commit,
             });
           } finally {
             linked.dispose();
@@ -766,10 +846,51 @@ export function ydb<C extends Contract<SqlStorage>>(
         },
       };
       const tx: YdbTransactionContext<C> = Object.defineProperties(
-        members(scopedRuntime, scopedNative, checkActive, failMutationScope),
+        members(
+          scopedRuntime,
+          scopedNative,
+          checkActive,
+          failMutationScope,
+          (active) => {
+            mutationScopes += active ? 1 : -1;
+          },
+        ),
         {
           signal: { value: controller.signal, enumerable: true },
-          invalidated: { get: () => settled, enumerable: true },
+          invalidated: {
+            get: () => settled || queryable.committed,
+            enumerable: true,
+          },
+          commitWith: {
+            enumerable: true,
+            async value<T>(callback: () => T | PromiseLike<T>): Promise<T> {
+              checkActive();
+              if (commitScope)
+                throw new Error('Nested commitWith calls are not supported');
+              const scope = {
+                statements: 0,
+                failure: undefined as Error | undefined,
+              };
+              commitScope = scope;
+              try {
+                const value = await callback();
+                if (scope.failure) throw scope.failure;
+                if (!scope.statements)
+                  throw new Error('commitWith requires at least one statement');
+                if (!queryable.committed) {
+                  checkActive();
+                  if (mutationScopes)
+                    throw new Error(
+                      'commitWith requires completed mutation scopes',
+                    );
+                  await queryable.commit();
+                }
+                return value;
+              } finally {
+                commitScope = undefined;
+              }
+            },
+          },
         },
       ) as YdbTransactionContext<C>;
       const callbackResult = Promise.resolve().then(() => callback(tx));
@@ -788,7 +909,7 @@ export function ydb<C extends Contract<SqlStorage>>(
       await scopedRuntime.close();
       if (mutationFailure) throw mutationFailure;
       settled = true;
-      await transaction.commit();
+      if (!transaction.committed) await transaction.commit();
       state.committed = true;
     } catch (error) {
       failed = true;

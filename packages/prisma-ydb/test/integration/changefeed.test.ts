@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { Json, Text, Uint64 } from '@ydbjs/value/primitive';
 import type {
   YdbChangeEvent,
   YdbChangefeedPartition,
 } from 'prisma-ydb/runtime';
-import { createFixture } from './helpers.ts';
+import { createFixture, quote } from './helpers.ts';
 
 test(
   'db.changefeed decodes managed feed records with the model codecs',
@@ -236,5 +237,131 @@ test(
     } finally {
       clearTimeout(failingTimeout);
     }
+  },
+);
+
+test(
+  'db.changefeed quarantines malformed records without blocking other partitions',
+  { timeout: 120_000 },
+  async (context) => {
+    const fixture = await createFixture(context, {
+      schema: (table) =>
+        [
+          '// use prisma-8',
+          'model Event {',
+          '  shard Uint64',
+          '  id String',
+          '  tags String[]',
+          '  @@id([shard, id])',
+          `  @@map("${table('Event')}")`,
+          '  @@changefeed("history", mode: NewImage, format: Json, retention: "P1D", partitions: 2, autoPartitioning: false, consumers: ["app"])',
+          '}',
+        ].join('\n'),
+    });
+    const planned = await fixture.prisma([
+      'migration',
+      'plan',
+      '--from',
+      '@empty',
+      '--name',
+      'initial',
+    ]);
+    assert.equal(planned.code, 0, planned.stdout + planned.stderr);
+    const migrated = await fixture.prisma(['db', 'migrate']);
+    assert.equal(migrated.code, 0, migrated.stdout + migrated.stderr);
+    // Native writes can violate the model's list encoding while remaining valid Json.
+    await fixture.native.executeYql({
+      text: `DECLARE $shard AS Uint64; DECLARE $id AS Utf8; DECLARE $tags AS Json; UPSERT INTO ${quote(fixture.table('Event'))} (shard, id, tags) VALUES ($shard, $id, $tags);`,
+      parameters: {
+        $shard: new Uint64(0n),
+        $id: new Text('bad'),
+        $tags: new Json('{}'),
+      },
+    });
+    await fixture.db.orm.Event.where({ shard: 0n, id: 'bad' }).update({
+      tags: [],
+    });
+    await fixture.db.orm.Event.create({
+      shard: 18446744073709551615n,
+      id: 'healthy-1',
+      tags: [],
+    });
+    await fixture.db.orm.Event.where({
+      shard: 18446744073709551615n,
+      id: 'healthy-1',
+    }).update({ tags: ['updated'] });
+
+    const events: YdbChangeEvent[] = [];
+    let failures = 0;
+    let badPartition: bigint | undefined;
+    for await (const batch of fixture.db.changefeed('Event', {
+      consumer: 'app',
+      waitMs: 500,
+      signal: AbortSignal.timeout(30_000),
+    })) {
+      events.push(...batch.events);
+      for (const partition of batch.partitions) {
+        for (const failure of partition.errors) {
+          failures++;
+          badPartition = failure.partitionId;
+          assert.equal(
+            failure.partitionSessionId,
+            partition.partitionSessionId,
+          );
+          assert.equal(failure.offset, 0n);
+          assert.ok(failure.error instanceof TypeError);
+          assert.match(failure.error.message, /not an array/);
+          assert.match(new TextDecoder().decode(failure.payload), /tags/);
+        }
+        assert.ok(
+          partition.events.every(
+            (event) => event.partition === partition.partitionId,
+          ),
+        );
+        if (partition.errors.length) await partition.commit();
+      }
+      await batch.commit();
+      if (failures && events.length === 2) break;
+    }
+    assert.equal(failures, 1);
+    assert.ok(events.every((event) => event.partition !== badPartition));
+    assert.deepEqual(
+      events.map((event) => event.key.id),
+      ['healthy-1', 'healthy-1'],
+    );
+
+    // A deliberate skip also verifies the bad partition was never acknowledged.
+    const starts: YdbChangefeedPartition[] = [];
+    const resumed: YdbChangeEvent[] = [];
+    for await (const batch of fixture.db.changefeed('Event', {
+      consumer: 'app',
+      waitMs: 500,
+      signal: AbortSignal.timeout(30_000),
+      onPartitionStart: (partition) => {
+        starts.push(partition);
+        return partition.partitionId === badPartition
+          ? { commitOffset: 1n, readOffset: 1n }
+          : undefined;
+      },
+    })) {
+      resumed.push(...batch.events);
+      await batch.commit();
+      if (resumed.length) break;
+    }
+    assert.equal(
+      starts.find((partition) => partition.partitionId === badPartition)
+        ?.committedOffset,
+      0n,
+    );
+    assert.equal(
+      starts.find((partition) => partition.partitionId !== badPartition)
+        ?.committedOffset,
+      2n,
+    );
+    assert.ok(starts.every((partition) => !partition.retentionExpired));
+    assert.deepEqual(
+      resumed.map((event) => event.key.id),
+      ['bad'],
+    );
   },
 );

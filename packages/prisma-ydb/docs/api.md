@@ -172,6 +172,21 @@ to no retry, and control-plane DDL explicitly disables it. Driver retries never
 replay low-level connection/transaction calls or statements inside an interactive
 transaction. Errors marked `outcomeUnknown` are never retried.
 
+`classifyYdbError(error)` exposes structured classification through cause chains
+and the primary failure of transaction aggregates: `kind`, `status`,
+`outcomeUnknown`, `retryable`, `retryableIfIdempotent`, `uniqueViolation` and an
+optional `ensure.message`. Only the authored Ensure message is retained by
+default; other server issue text stays hidden. Status 400120 by itself does not
+establish Ensure or uniqueness.
+
+`withRetry(fn, { budgetMs, signal?, idempotent?, maxAttempts?, onRetry?, ...delays })`
+retries autocommit work within one total budget including backoff. `fn` receives
+an abort signal to forward to the request. It never replays uncertain outcomes,
+application errors or cancellation, and rethrows the last failure on exhaustion.
+Both helpers are exported from runtime and driver entry points. See
+[error classification and autocommit retries](transactions.md#error-classification-and-autocommit-retry-helper)
+for the complete behavior and an example.
+
 Every `onEvent` includes a `pool` snapshot after the operation. Native session
 creation, including warmup, reports `operation: 'session-create'`, duration and
 success/failure. Retries report `operation: 'retry'`, the next `attempt`, and
@@ -338,7 +353,8 @@ Values are decoded with the model's codecs: `BigInt`/`Uint64` as exact `bigint`
 (YDB writes them as bare JSON numbers, which are parsed from their source text,
 never through doubles), `Decimal` as a string, `Date` as `YYYY-MM-DD`, lists as
 arrays. Unmapped columns are ignored. `event.raw` keeps the server record with
-integers beyond `Number.MAX_SAFE_INTEGER` as decimal strings. `event.ts` is set
+integers beyond `Number.MAX_SAFE_INTEGER` as decimal strings. It is computed
+on first access, cached, and remains enumerable for serialization. `event.ts` is set
 only when the feed records virtual timestamps. `feed` is required when the model
 declares several changefeeds, and the consumer must exist on the topic (declare
 it in `consumers`). The iterator ends when `signal` aborts or the client closes;
@@ -365,12 +381,44 @@ for await (const batch of db.changefeed('Order', {
 ```
 
 Each hook receives `partitionId`, `partitionSessionId`, `committedOffset` and the
-retained `startOffset`/`endOffset`. A start position may set `commitOffset` and
+retained `startOffset`/`endOffset`, plus `retentionExpired` when
+`committedOffset < startOffset`. A start position may set `commitOffset` and
 `readOffset` (not below the commit offset); omitted fields keep the server's
 committed position. Reading of a partition waits for its start hook. An
 exception thrown by a hook ends the iteration with that error. Committing a batch
 of a partition that has since been taken away rejects with an `Error`; its
 messages are redelivered to the partition's next reader.
+
+Batches also expose `partitions`, each with `partitionId`, `partitionSessionId`,
+`events`, `errors` and `commit()`. A malformed record becomes an error entry
+`{ partitionId, partitionSessionId, offset, error, payload }`; it does not end the
+iterator. The payload is the original `Uint8Array`. The affected assignment is
+quarantined: subsequent records are drained without delivery or acknowledgement,
+while other partitions continue. `batch.commit()` acknowledges only groups with
+no errors; a partition group's `commit()` acknowledges its decoded prefix only,
+never the failed record or anything after it. Process that prefix before committing.
+
+`@ydbjs/topic` 6.1.4 has no reader method to pause one partition. Quarantine is
+client-side, so it still consumes network bandwidth. A new assignment retries
+from the stored consumer offset. To explicitly skip a repaired/dead-lettered
+record, close the iterator and restart it with `onPartitionStart` returning
+`{ readOffset: badOffset + 1n, commitOffset: badOffset + 1n }` for that partition.
+This deliberately advances its checkpoint; persist any required prefix first.
+
+`db.topic()` returns the `@ydbjs/topic` client on the same connected gRPC driver:
+
+```ts
+const writer = db.topic().createWriter({ topic: '/local/application-events' });
+try {
+  writer.write(new TextEncoder().encode(JSON.stringify({ type: 'updated' })));
+  await writer.flush();
+} finally {
+  await writer.close();
+}
+```
+
+Close readers and writers you create before closing `db`. The exported
+`topicClient(driver)` helper provides the same access for a connected `YdbDriver`.
 
 ## Type mapping
 

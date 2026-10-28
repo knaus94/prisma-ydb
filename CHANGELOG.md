@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add `tx.commitWith(() => ...)` to commit with a single final direct statement, saving the separate commit RPC; ORM mutation scopes retain a normal atomic commit. Reject empty thunks and multiple direct statements.
+- Add per-path `active`, `total` and `errors` statistics for autocommit, streaming, bulk upload chunks and held leases, plus abandoned-stream counts in `db.stats()` and `driver.stats`.
+- Add contract-derived typed YQL model helpers for declarations, struct/list parameters and codec-decoded results, including `db.yqlModel(name, { fields })`.
+- Add a shared-driver topic client (`db.topic()`) and partition-grouped changefeed batches with retention-gap reporting and decode-error quarantine, preserving clean-partition delivery and commits.
+- Add cause-aware YDB error classification with safe authored Ensure messages and a budgeted, abortable autocommit retry helper.
+- Fix changefeed restarts after `onPartitionStart` overrides `commitOffset`: the SDK's next commit position is synchronized, so later commits are no longer rejected.
+- Speed up native model encoding and decoding: precompiled per-column protobuf encoders shared by `yqlModel` and `bulkUpsert`, and direct codec decoders without a JSON round trip.
+- Speed up changefeed decoding: plain `JSON.parse` when no integer can exceed 2^53, a shared `TextDecoder` and a lazily built `raw`.
+- Add fast paths for canonical Decimal, Date and Timestamp values in the codec helpers used by every ORM read; accepted inputs and errors are unchanged.
+
 - Fix `db.changefeed` precision loss: Int64/Uint64 values, keys and virtual timestamps arrive as bare JSON numbers and are now parsed from their source text into exact `bigint`s; `raw` keeps unsafe integers as decimal strings.
 - Fix `db.changefeed` decoding of `Date` columns, which YDB writes as midnight timestamps.
 - Add `onPartitionStart` (with an optional start position), `onPartitionStop` and `onCommitted` hooks to `db.changefeed`. Omitted start-position fields keep the server's committed offset, hook exceptions end the iteration, and commits of a revoked partition reject with an `Error`. Events expose `partitionSessionId`.

@@ -31,7 +31,13 @@ test('bulkUpsert encodes model rows through the contract codecs', async (context
     ...(index % 3 ? { amount: `${index}.25` } : {}),
     ...(index % 5 ? {} : { big: BigInt(index) * 1_000_000_000n }),
   }));
-  const result = await db.bulkUpsert('Item', rows, { chunkSize: 1000 });
+  const before = db.stats().paths.bulkUpsert;
+  const upload = db.bulkUpsert('Item', rows, { chunkSize: 1000 });
+  const result = await upload;
+  const after = db.stats().paths.bulkUpsert;
+  assert.equal(after.total - before.total, 3);
+  assert.equal(after.errors, before.errors);
+  assert.equal(after.active, 0);
   assert.deepEqual(result, { rows: 2500, chunks: 3 });
 
   const count = await db.orm.Item.aggregate((aggregate) => ({

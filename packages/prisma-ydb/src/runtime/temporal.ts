@@ -14,10 +14,45 @@ const timestampPattern =
   /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z$/;
 const timestampType = new PrimitiveType(Type_PrimitiveTypeId.TIMESTAMP);
 
+const canonicalTimestamp =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?Z$/;
+const monthDays = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function twoDigits(text: string, offset: number): number {
+  return (text.charCodeAt(offset) - 48) * 10 + text.charCodeAt(offset + 1) - 48;
+}
+
+/** Called only after a fixed-width date/timestamp grammar has checked the digits. */
+function validCalendarDate(text: string): boolean {
+  const year = twoDigits(text, 0) * 100 + twoDigits(text, 2);
+  const month = twoDigits(text, 5);
+  const day = twoDigits(text, 8);
+  if (year < 1970 || year > 2105 || month < 1 || month > 12 || day < 1)
+    return false;
+  const maxDay =
+    month === 2 && year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+      ? 29
+      : monthDays[month - 1];
+  return day <= maxDay;
+}
+
+/** Validate the common three/six-fraction-digit forms without Date allocation. */
+export function isCanonicalYdbTimestamp(text: string): boolean {
+  return (
+    (text.length === 24 || text.length === 27) &&
+    canonicalTimestamp.test(text) &&
+    validCalendarDate(text) &&
+    twoDigits(text, 11) < 24 &&
+    twoDigits(text, 14) < 60 &&
+    twoDigits(text, 17) < 60
+  );
+}
+
 export function dateText(value: unknown): string {
   const text = value instanceof Date ? value.toISOString().slice(0, 10) : value;
   if (typeof text !== 'string' || !datePattern.test(text))
     throw new TypeError('Date requires YYYY-MM-DD or a JavaScript Date');
+  if (text.length === 10 && validCalendarDate(text)) return text;
   const instant = new Date(`${text}T00:00:00.000Z`);
   if (
     !Number.isFinite(instant.getTime()) ||
@@ -33,6 +68,8 @@ export function dateText(value: unknown): string {
 
 export function timestampText(value: unknown): string {
   const text = value instanceof Date ? value.toISOString() : value;
+  if (typeof text === 'string' && isCanonicalYdbTimestamp(text))
+    return text.length === 27 ? text : text.slice(0, -1) + '000Z';
   const match = typeof text === 'string' && timestampPattern.exec(text);
   if (!match)
     throw new TypeError(

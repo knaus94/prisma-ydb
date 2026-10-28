@@ -11,6 +11,8 @@ export class YdbQueryError extends SqlQueryError {
   readonly status: number;
   readonly outcomeUnknown: boolean;
   readonly issueCodes: readonly number[];
+  readonly uniqueViolation: boolean;
+  readonly ensure?: { readonly message: string };
 
   constructor(
     status: number,
@@ -19,6 +21,7 @@ export class YdbQueryError extends SqlQueryError {
     issueCodes: readonly number[] = [],
     cause?: Error,
     uniqueViolation = false,
+    ensure?: { readonly message: string },
   ) {
     super(`YDB ${operation} failed: ${Status[status] ?? 'UNKNOWN_STATUS'}`, {
       sqlState: uniqueViolation
@@ -31,6 +34,8 @@ export class YdbQueryError extends SqlQueryError {
     this.status = status;
     this.outcomeUnknown = outcomeUnknown;
     this.issueCodes = issueCodes;
+    this.uniqueViolation = uniqueViolation;
+    this.ensure = ensure;
   }
 }
 
@@ -72,9 +77,24 @@ export function normalizeError(
     const issueCodes: number[] = [];
     let uniqueViolation = false;
     let referentialViolation = false;
+    let ensure: { message: string } | undefined;
     const visit = (issues: readonly unknown[]): void => {
       for (const issue of issues) {
         if (typeof issue !== 'object' || issue === null) continue;
+        // Observed on YDB 26.2: retain only Ensure's authored message, never
+        // the surrounding server diagnostics, source position or query text.
+        if (
+          error.code === Status.PRECONDITION_FAILED &&
+          !('issueCode' in issue) &&
+          'message' in issue &&
+          typeof issue.message === 'string'
+        ) {
+          const match =
+            /^Terminate was called, reason\(\d+\): <main>:\d+:\d+: Condition violated:\n\n([\s\S]*)\n\n\n$/.exec(
+              issue.message,
+            );
+          if (match) ensure = { message: match[1]! };
+        }
         if ('issueCode' in issue && typeof issue.issueCode === 'number')
           issueCodes.push(issue.issueCode);
         if (
@@ -112,6 +132,7 @@ export function normalizeError(
       issueCodes,
       includeServerIssues ? error : undefined,
       error.code === Status.PRECONDITION_FAILED && uniqueViolation,
+      ensure,
     );
   }
   if (error instanceof SqlConnectionError || error instanceof SqlQueryError)
@@ -176,6 +197,100 @@ export function isRetryableYdbError(
     (retryableStatuses.has(error.status) ||
       (idempotent && idempotentStatuses.has(error.status)))
   );
+}
+
+export interface YdbErrorClassification {
+  readonly kind:
+    | 'unique'
+    | 'ensure'
+    | 'referential'
+    | 'conflict'
+    | 'overloaded'
+    | 'unavailable'
+    | 'session'
+    | 'transport'
+    | 'timeout'
+    | 'cancelled'
+    | 'query'
+    | 'unknown';
+  readonly status?: number;
+  readonly outcomeUnknown: boolean;
+  readonly retryable: boolean;
+  readonly retryableIfIdempotent: boolean;
+  readonly uniqueViolation: boolean;
+  readonly ensure?: { readonly message: string };
+}
+
+/** Follow wrappers, preserving the primary failure of transaction aggregates. */
+export function classifyYdbError(error: unknown): YdbErrorClassification {
+  const seen = new Set<unknown>();
+  let outcomeUnknown = false;
+  while (typeof error === 'object' && error !== null && !seen.has(error)) {
+    seen.add(error);
+    if ('outcomeUnknown' in error && error.outcomeUnknown === true)
+      outcomeUnknown = true;
+    if (error instanceof AggregateError) {
+      error = error.errors[0];
+      continue;
+    }
+    if (error instanceof YDBError) {
+      error = normalizeError(error, 'query');
+      continue;
+    }
+    if (error instanceof YdbQueryError || error instanceof YdbTransportError) {
+      outcomeUnknown ||= error.outcomeUnknown;
+      const status = error instanceof YdbQueryError ? error.status : undefined;
+      const uniqueViolation =
+        error instanceof YdbQueryError && error.uniqueViolation;
+      const ensure = error instanceof YdbQueryError ? error.ensure : undefined;
+      let kind: YdbErrorClassification['kind'];
+      if (uniqueViolation) kind = 'unique';
+      else if (ensure) kind = 'ensure';
+      else if (error instanceof YdbTransportError)
+        kind =
+          error.grpcCode === 1
+            ? 'cancelled'
+            : error.grpcCode === 4
+              ? 'timeout'
+              : 'transport';
+      else if (status === Status.ABORTED) kind = 'conflict';
+      else if (status === Status.OVERLOADED) kind = 'overloaded';
+      else if (status === Status.UNAVAILABLE) kind = 'unavailable';
+      else if (status !== undefined && deadSessionStatuses.has(status))
+        kind = 'session';
+      else if (status === Status.TIMEOUT) kind = 'timeout';
+      else if (status === Status.CANCELLED) kind = 'cancelled';
+      else kind = 'query';
+      const eligible =
+        !outcomeUnknown && !uniqueViolation && !ensure && kind !== 'cancelled';
+      return {
+        kind,
+        status,
+        outcomeUnknown,
+        uniqueViolation,
+        ensure,
+        retryable: eligible && isRetryableYdbError(error, false),
+        retryableIfIdempotent: eligible && isRetryableYdbError(error, true),
+      };
+    }
+    if ('code' in error && error.code === 'YDB.REFERENTIAL_ACTION')
+      return {
+        kind: 'referential',
+        outcomeUnknown,
+        retryable: false,
+        retryableIfIdempotent: false,
+        uniqueViolation: false,
+      };
+    if ('cause' in error) error = error.cause;
+    else break;
+  }
+  return {
+    kind: 'unknown',
+    outcomeUnknown,
+    retryable: false,
+    retryableIfIdempotent: false,
+    uniqueViolation: false,
+  };
 }
 
 /** Sessions that YDB reported as unusable; the pool must not hand them out again. */

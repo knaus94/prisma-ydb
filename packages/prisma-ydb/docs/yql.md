@@ -47,6 +47,60 @@ Native decoding retains all 128 bits and returns lowercase strings, recursively
 inside optional, list and struct results. Bind UUID values explicitly; a plain
 string remains Utf8 unless a compiled ORM parameter declares the UUID codec.
 
+## Contract-derived model parameters and results
+
+Use `yqlModel(contract, 'Task')`, or `db.yqlModel('Task')`, to derive native
+YQL mappings from the same contract as the ORM. This avoids maintaining separate
+column names, YQL declarations and typed-value constructors:
+
+```ts
+import { yqlModel } from 'prisma-ydb/runtime';
+
+const task = yqlModel(db.contract, 'Task', {
+  fields: ['id', 'title', 'done', 'createdAt', 'updatedAt'],
+});
+await db.yql(
+  `${task.declare('rows', 'list')}
+   UPSERT INTO ${task.table} SELECT * FROM AS_TABLE($rows);`,
+  {
+    rows: task.rows([
+      {
+        id: taskId,
+        title: 'Hello',
+        done: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ]),
+  },
+);
+const rows = await db.yql(`SELECT * FROM ${task.table} LIMIT 10;`);
+const decoded = task.decodeAll(rows); // Contract field names and ORM value types.
+```
+
+`table` is a quoted physical path. `columns` provides the selected field names,
+physical column names, YQL types (including optional markers), nullability and
+list flags. `structType` and `listType` can be used in hand-written declarations;
+`declare(name, 'struct' | 'list')` validates the parameter name and renders a full
+`DECLARE` statement. Parameter names may include the leading `$`.
+
+`rows()` encodes a typed `List<Struct<...>>`; `row()` encodes one typed
+`Struct<...>`. Both share the bulk-upload codec encoder. With a generated
+contract, input and decoded row types follow its field type maps, including enum
+and JSON value-object refinements. Omit `fields` to select every stored field,
+or provide a nonempty, unique list to select a projection. Unknown or unselected
+input fields are rejected; missing nullable fields become NULL, while required
+fields must be supplied. Presets, defaults and referential actions are bypassed.
+
+`decode()` converts a native row's physical column names into the selected model
+fields. It requires every selected column, ignores extra result columns, and
+decodes Timestamp microseconds, Date, Decimal, JSON and scalar lists through
+the contract codecs. DateTime becomes a JavaScript `Date` with millisecond
+precision; Timestamp retains its six-digit UTC string. `decodeAll()` accepts
+either flat native rows from `db.yql()` or a buffered `db.queryYql()` result,
+flattening all its result sets. Use decoded native results rather than
+`valueMode: 'wire'` with these helpers.
+
 ## Result sets, timeouts and statistics
 
 Use exact native typed values for parameterized decimals and microseconds:

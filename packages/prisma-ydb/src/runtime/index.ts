@@ -11,6 +11,8 @@ export type {
 export type { YdbBulkUpsertOptions, YdbBulkUpsertResult } from './bulk.js';
 export type {
   YdbChangeBatch,
+  YdbChangefeedDecodeError,
+  YdbChangePartitionBatch,
   YdbChangeEvent,
   YdbChangefeedOptions,
   YdbChangefeedPartition,
@@ -85,3 +87,19 @@ export {
 export { Optional } from '@ydbjs/value/optional';
 export { List } from '@ydbjs/value/list';
 export { Struct } from '@ydbjs/value/struct';
+
+export { topicClient } from './topic.js';
+export {
+  yqlModel,
+  type YdbModelName,
+  type YdbYqlColumn,
+  type YdbYqlModel,
+  type YdbYqlInput,
+  type YdbYqlOutput,
+} from './yql-model.js';
+export {
+  classifyYdbError,
+  type YdbErrorClassification,
+  withRetry,
+  type WithRetryOptions,
+} from '../driver/index.js';

@@ -54,6 +54,34 @@ await db.transaction(async (tx) => {
 });
 ```
 
+For a final ORM, SQL-builder or prepared statement, use `tx.commitWith`:
+
+```ts
+await db.transaction(async (tx) => {
+  const project = await tx.orm.Project.where({ id }).first();
+  await tx.commitWith(() =>
+    tx.orm.Project.where({ id }).updateAll({ archived: true }),
+  );
+  return project;
+});
+```
+
+A direct first statement in the thunk carries `commitTx`, reducing N + 1 RPCs
+to N. Single-statement writes such as `create` without nested relations,
+`createAll`, `updateAll`, `deleteAll`, `updateAndCount`, `deleteAndCount` and
+`upsert`, as well as native YQL, can use this path.
+
+ORM mutation scopes never carry `commitTx` on an individual statement. This
+includes `update()` or `delete()` on unique filters, nested mutation graphs and
+multi-table inheritance writes. `commitWith` waits for the entire scope and
+then sends a normal commit RPC, preserving atomicity without saving a round trip.
+
+A thunk with no statements rejects locally. A second direct statement rejects
+before it is sent; when the first direct statement already committed, that
+commit cannot be undone. A direct statement after scoped statements also
+rejects. Await the thunk's database work before returning, and do not start
+other transaction work concurrently with it.
+
 After a statement-level commit, the transaction accepts no further statements:
 the callback's own commit becomes a no-op, more queries through `tx` fail, and a
 callback exception no longer rolls anything back or triggers a retry. A failed
@@ -124,6 +152,51 @@ Native streaming stops retrying after its first yielded part, avoiding duplicate
 delivery of rows. Statements inside an interactive transaction do not retry
 individually. A conflict requires replaying the whole transaction. See the
 [API retry classification](api.md#driver-options-and-retries) for status details.
+
+## Error classification and autocommit retry helper
+
+`classifyYdbError(error)` follows `cause` chains and the primary (first) error in
+transaction `AggregateError` wrappers. It returns `kind`, optional YDB `status`,
+`outcomeUnknown`, `retryable`, `retryableIfIdempotent`, `uniqueViolation`, and an
+optional `ensure: { message }`. Kinds distinguish unique constraints, authored
+Ensure failures, referential guards, conflicts, overload, unavailability,
+sessions, transport, timeout, cancellation, other query failures and unknown
+errors. Unknown application errors and cancellation are never replayed.
+
+On local YDB 26.2, failed YQL `Ensure` returns `PRECONDITION_FAILED` (400120),
+without issue codes. This status alone does not identify Ensure or uniqueness.
+The normalizer recognizes the observed Ensure envelope and keeps only the
+authored message, including multiline text; `ensure` is absent when
+Ensure has no message. It omits server diagnostics and the underlying cause
+unless `includeServerIssues` is enabled. Unique violations require the observed
+duplicate-key issue, and `YDB.REFERENTIAL_ACTION` remains a referential error.
+
+For autocommit application work, use `withRetry` from `prisma-ydb/runtime` or
+`prisma-ydb/driver`:
+
+```ts
+const result = await withRetry(
+  (signal) => db.queryYql({ text, parameters, signal, retry: false }),
+  {
+    budgetMs: 5000,
+    maxAttempts: 3,
+    idempotent: true,
+    onRetry: ({ attempt, delayMs }) => log({ attempt, delayMs }),
+  },
+);
+```
+
+The function receives a signal covering caller cancellation and the total time
+budget. Forward it to in-flight work. The budget includes attempts and full-jitter
+backoff; cancellation interrupts sleep. Five total attempts and the driver delay
+defaults apply unless overridden. Delay options may be supplied directly or in
+`retry`. `onRetry` runs before backoff and reports the next attempt (starting at
+2). No replay follows an unknown outcome or a non-retryable error. Exhaustion or
+cancellation after a failed attempt rethrows the last failure; before a failure,
+cancellation returns its reason and budget exhaustion raises `TimeoutError`.
+The helper cannot stop external work that ignores its signal. Use it around
+autocommit operations, and use `db.transaction(..., { retry })` to replay complete
+transaction callbacks.
 
 ## Timeouts and cancellation
 

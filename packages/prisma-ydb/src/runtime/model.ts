@@ -1,3 +1,11 @@
+import { create } from '@bufbuild/protobuf';
+import {
+  TypeSchema,
+  ValueSchema,
+  type Value as WireValue,
+} from '@ydbjs/api/value';
+import { parameterType } from '../driver/values.js';
+import { nativeCodecConversions, yqlTypeForCodec } from './codecs.js';
 import type { Contract } from '@prisma/orm-framework/contract/types';
 import type {
   SqlStorage,
@@ -29,6 +37,10 @@ export interface ResolvedModel {
 }
 
 const cache = new WeakMap<Contract<SqlStorage>, Map<string, ResolvedModel>>();
+// Protobuf serialization only reads values, so optional null cells can share one.
+const nullCell = create(ValueSchema, {
+  value: { case: 'nullFlagValue', value: 0 },
+});
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -108,4 +120,95 @@ export function resolveModel(
   };
   models.set(name, resolved);
   return resolved;
+}
+
+export function modelMemberType(column: ModelColumn): string {
+  const base = column.many
+    ? 'Json'
+    : yqlTypeForCodec(column.codecId, column.typeParams);
+  return column.nullable ? `${base}?` : base;
+}
+
+/** Compile member types and cell encoders once for one model field set. */
+export function compileModelRowEncoder(
+  columns: readonly ModelColumn[],
+  primaryKey?: readonly ModelColumn[],
+) {
+  const members = columns.map((column) => ({
+    name: column.column,
+    type: parameterType(modelMemberType(column)),
+  }));
+  const type = create(TypeSchema, {
+    type: { case: 'structType', value: { members } },
+  });
+  const listType = create(TypeSchema, {
+    type: { case: 'listType', value: { item: type } },
+  });
+  const encoders = columns.map((column) => {
+    const codec = nativeCodecConversions(column.codecId, column.typeParams);
+    const encode = column.many
+      ? (value: unknown) => {
+          if (!Array.isArray(value))
+            throw new TypeError(
+              `${column.field} is a list and requires an array`,
+            );
+          return create(ValueSchema, {
+            value: {
+              case: 'textValue',
+              value: JSON.stringify(
+                value.map((element: unknown) => {
+                  if (element === null || element === undefined)
+                    throw new TypeError(
+                      `${column.field} list elements cannot be null`,
+                    );
+                  return codec.encodeJson(element);
+                }),
+              ),
+            },
+          });
+        }
+      : codec.encode;
+    return {
+      field: column.field,
+      key: !!primaryKey?.includes(column),
+      encode: (value: unknown): WireValue => {
+        if (value === null || value === undefined) {
+          if (!column.nullable)
+            throw new TypeError(
+              `${column.field} is required and cannot be null`,
+            );
+          return nullCell;
+        }
+        return encode(value);
+      },
+    };
+  });
+  return {
+    type,
+    listType,
+    row(row: Readonly<Record<string, unknown>>, index: number): WireValue {
+      const items: WireValue[] = new Array(encoders.length);
+      for (let position = 0; position < encoders.length; position++) {
+        const column = encoders[position];
+        const value = Object.hasOwn(row, column.field)
+          ? row[column.field]
+          : undefined;
+        if ((value === undefined || value === null) && column.key)
+          throw new TypeError(
+            `Row ${index} lacks primary key field ${column.field}`,
+          );
+        try {
+          items[position] = column.encode(value);
+        } catch (error) {
+          throw new TypeError(
+            `Row ${index}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return create(ValueSchema, { items });
+    },
+    list(items: WireValue[]) {
+      return { type: listType, value: create(ValueSchema, { items }) };
+    },
+  };
 }

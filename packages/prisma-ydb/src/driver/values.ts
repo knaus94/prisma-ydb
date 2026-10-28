@@ -331,6 +331,7 @@ export function sqlRequest(
     parameters,
     signal: request.signal,
     timeoutMs: request.timeoutMs,
+    commit: request.commit,
     // Compiler-tagged SELECTs are read-only and replay-safe; they follow the
     // configured read mode. Mutations keep the serializable default.
     transactionMode: compiledSelect ? readTransactionMode : undefined,

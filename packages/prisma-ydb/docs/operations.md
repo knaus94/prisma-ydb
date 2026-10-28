@@ -68,7 +68,8 @@ Unknown keys and invalid values are rejected. Size the pool against measured
 latency, database capacity and application concurrency. Each native session has
 an attach stream; larger pools also increase transport resource usage. Queue
 rejection is deliberate load shedding. Slow transaction callbacks hold sessions
-for their whole duration, and there is no separate transaction quota.
+for their whole duration; `maxTransactionSessions` limits held leases so the
+remaining pool capacity stays available to autocommit statements.
 
 Session age/idle retirement provides turnover; it is not a promise that active
 transactions migrate between nodes. Active transactions remain attached to their
@@ -108,6 +109,26 @@ invariant. Run `prisma db verify` during deployment for managed schema validatio
 (interactive transactions and explicit connections); `closing` counts background
 cleanup operations.
 
+The snapshot also includes `paths.autocommit`, `paths.streaming`,
+`paths.bulkUpsert` and `paths.held`, each with `active`, `total` and `errors`.
+Counters are cumulative for this driver instance; snapshots are independent
+copies. Autocommit counts buffered native and ORM requests, streaming counts
+native streams and `db.streaming`, and bulk writes count each low-level upload
+chunk. Retries stay within one logical request. `active` includes acquisition
+and backoff for these request paths; a stream remains active until consumed or
+returned. `paths.streaming.abandoned` counts early consumer returns separately
+from thrown failures, which increment `errors`. Health probes use autocommit.
+
+For `held`, `total` counts explicit lease acquisition attempts, `active` counts
+successfully acquired leases until return, and `errors` counts failed
+acquisitions or returned leases with a failed operation or discarded session,
+once per lease. It includes interactive transactions, Prisma mutation graphs
+and explicit connections. Root ORM mutations that acquire such a lease are
+counted under `held`. Use its active level and total/error deltas together with
+`waiters` to tune `maxTransactionSessions`; do not add path counters together as
+though they all counted individual statements. Counter updates reuse fixed
+objects; copies are created only when a snapshot is requested.
+
 ```ts
 const db = ydb<Contract>({
   contractJson,
@@ -124,8 +145,10 @@ const db = ydb<Contract>({
 Events cover connect, acquire, session-create, query, begin, commit, rollback,
 destroy, bulk-upsert and driver retry. Retry events include the next attempt number. `begin`
 is a local event: the server transaction starts with the first statement.
-`commit` and `rollback` of a transaction without server statements, or after a
-statement-level commit, are local as well.
+`commit` and `rollback` of a transaction without server statements are local as
+well. After a statement-level commit, `db.transaction` skips the final commit
+entirely, so it produces no additional commit RPC or commit event. Repeated
+`commit()` calls on a low-level committed handle remain local.
 Whole-callback retry counting should be instrumented by the application; do not
 assume a driver retry event covers every callback replay.
 

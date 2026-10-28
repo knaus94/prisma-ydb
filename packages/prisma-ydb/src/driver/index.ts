@@ -4,8 +4,15 @@ export {
   YdbQueryError,
   YdbTransportError,
   isRetryableYdbError,
+  classifyYdbError,
+  type YdbErrorClassification,
 } from './errors.js';
-export { retryDefaults, retryDelayMs } from './retry.js';
+export {
+  retryDefaults,
+  retryDelayMs,
+  withRetry,
+  type WithRetryOptions,
+} from './retry.js';
 export { UuidValue } from './uuid.js';
 export { decodeValue, isParameter, structList } from './values.js';
 export type { StructMember } from './values.js';
@@ -18,6 +25,7 @@ export type {
   YdbTransactionMode,
   YdbRetryOptions,
   YdbPoolStats,
+  YdbPathStats,
   YdbDriverOptions,
   YdbDriverEvent,
   YdbParameter,

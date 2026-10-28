@@ -30,13 +30,27 @@ test('db.streaming yields rows beyond the buffered result bounds', async (contex
   context.after(() => db.close());
   await db.connect();
 
+  const before = db.stats().paths;
   await assert.rejects(
     async () => db.orm.Row.all(),
     /buffered result limit exceeded/,
   );
 
+  assert.equal(db.stats().paths.autocommit.total - before.autocommit.total, 1);
+  assert.equal(
+    db.stats().paths.autocommit.errors - before.autocommit.errors,
+    1,
+  );
+  assert.equal(db.stats().paths.autocommit.active, 0);
+
   const seen: number[] = [];
-  for await (const row of db.streaming.orm.Row.all()) seen.push(row.id);
+  for await (const row of db.streaming.orm.Row.all()) {
+    assert.equal(db.stats().paths.streaming.active, 1);
+    seen.push(row.id);
+  }
+  assert.equal(db.stats().paths.streaming.total - before.streaming.total, 1);
+  assert.equal(db.stats().paths.streaming.errors, before.streaming.errors);
+  assert.equal(db.stats().paths.streaming.active, 0);
   assert.equal(seen.length, 300);
   assert.equal(new Set(seen).size, 300);
 
@@ -47,6 +61,13 @@ test('db.streaming yields rows beyond the buffered result bounds', async (contex
     if (++taken === 1) break;
   }
   assert.equal(taken, 1);
+  assert.equal(db.stats().paths.streaming.total - before.streaming.total, 2);
+  assert.equal(db.stats().paths.streaming.errors, before.streaming.errors);
+  assert.equal(
+    db.stats().paths.streaming.abandoned - before.streaming.abandoned,
+    1,
+  );
+  assert.equal(db.stats().paths.streaming.active, 0);
   // The abandoned session is deleted in the background; it never returns to the pool.
   const deadline = Date.now() + 5_000;
   while (db.stats().leased && Date.now() < deadline)

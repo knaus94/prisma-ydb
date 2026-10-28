@@ -1,10 +1,11 @@
-import { Json } from '@ydbjs/value/primitive';
 import type { Contract } from '@prisma/orm-framework/contract/types';
 import type { SqlStorage } from '@prisma/orm-family-sql/contract/types';
-import { structList, type StructMember } from '../driver/values.js';
 import type { YdbDriver } from '../driver/driver.js';
-import { encodeYdbJson, encodeYdbValue, yqlTypeForCodec } from './codecs.js';
-import { resolveModel, type ModelColumn } from './model.js';
+import {
+  resolveModel,
+  compileModelRowEncoder,
+  type ModelColumn,
+} from './model.js';
 
 export interface YdbBulkUpsertOptions {
   /** Rows per BulkUpsert RPC; chunks are sent sequentially and retried individually. */
@@ -16,35 +17,6 @@ export interface YdbBulkUpsertOptions {
 export interface YdbBulkUpsertResult {
   readonly rows: number;
   readonly chunks: number;
-}
-
-function memberType(column: ModelColumn): string {
-  const base = column.many
-    ? 'Json'
-    : yqlTypeForCodec(column.codecId, column.typeParams);
-  return column.nullable ? `${base}?` : base;
-}
-
-function encodeField(column: ModelColumn, value: unknown): unknown {
-  if (value === null || value === undefined) {
-    if (!column.nullable)
-      throw new TypeError(`${column.field} is required and cannot be null`);
-    return null;
-  }
-  if (column.many) {
-    if (!Array.isArray(value))
-      throw new TypeError(`${column.field} is a list and requires an array`);
-    return new Json(
-      JSON.stringify(
-        value.map((element) => {
-          if (element === null || element === undefined)
-            throw new TypeError(`${column.field} list elements cannot be null`);
-          return encodeYdbJson(column.codecId, element, column.typeParams);
-        }),
-      ),
-    );
-  }
-  return encodeYdbValue(column.codecId, value, column.typeParams);
 }
 
 /**
@@ -73,44 +45,24 @@ export async function bulkUpsertModel(
       : model.primaryKey.map((key) => key.field),
   );
   for (const row of rows)
-    for (const field of Object.keys(row)) {
+    for (const field in row) {
+      if (!Object.hasOwn(row, field)) continue;
       if (!model.byField.has(field))
         throw new TypeError(`Unknown field ${field} on YDB model ${modelName}`);
       present.add(field);
     }
-  const members: StructMember[] = [];
   const columns: ModelColumn[] = [];
   for (const column of model.columns)
     if (present.has(column.field)) {
       columns.push(column);
-      members.push({ name: column.column, type: memberType(column) });
     }
-  const encoded = rows.map((row, index) => {
-    const struct: Record<string, unknown> = Object.create(null);
-    for (const column of columns) {
-      const value = row[column.field];
-      if (
-        (value === undefined || value === null) &&
-        model.primaryKey.includes(column)
-      )
-        throw new TypeError(
-          `Row ${index} lacks primary key field ${column.field}`,
-        );
-      try {
-        struct[column.column] = encodeField(column, value);
-      } catch (error) {
-        throw new TypeError(
-          `Row ${index}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
-    return struct;
-  });
+  const encoder = compileModelRowEncoder(columns, model.primaryKey);
+  const encoded = rows.map((row, index) => encoder.row(row, index));
   let chunks = 0;
   for (let offset = 0; offset < encoded.length; offset += chunkSize) {
     await driver.bulkUpsert({
       table: model.table,
-      rows: structList(members, encoded.slice(offset, offset + chunkSize)),
+      rows: encoder.list(encoded.slice(offset, offset + chunkSize)),
       signal: options.signal,
       timeoutMs: options.timeoutMs,
     });

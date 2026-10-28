@@ -88,6 +88,8 @@ export interface YdbQueryRequest {
 }
 
 export interface YdbSqlExecuteRequest extends SqlExecuteRequest {
+  /** Commit with this statement inside an interactive transaction. */
+  readonly commit?: boolean;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
 }
@@ -137,7 +139,19 @@ export interface YdbRetryOptions {
   readonly overloadedMaxDelayMs?: number;
 }
 
+export interface YdbPathStats {
+  readonly active: number;
+  readonly total: number;
+  readonly errors: number;
+}
+
 export interface YdbPoolStats {
+  readonly paths: {
+    readonly autocommit: YdbPathStats;
+    readonly streaming: YdbPathStats & { readonly abandoned: number };
+    readonly bulkUpsert: YdbPathStats;
+    readonly held: YdbPathStats;
+  };
   readonly maxSessions: number;
   readonly idle: number;
   readonly leased: number;

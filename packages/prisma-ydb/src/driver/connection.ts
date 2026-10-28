@@ -197,6 +197,7 @@ export class YdbConnection implements SqlConnection {
   readonly #sink: EventSink;
   readonly #returned: (reusable: boolean) => void;
   #closed = false;
+  #failed = false;
   #tainted = false;
   #destroying = false;
   #busy = 0;
@@ -216,6 +217,11 @@ export class YdbConnection implements SqlConnection {
 
   get #config(): Options {
     return this.#sink.config;
+  }
+
+  /** Whether any operation failed during this lease. */
+  get failed(): boolean {
+    return this.#failed;
   }
 
   /** Clean handles go back to the pool; anything else must be destroyed. */
@@ -340,6 +346,7 @@ export class YdbConnection implements SqlConnection {
         this.#settle(transaction);
       }
     } catch (error) {
+      this.#failed = true;
       failure = normalizeError(
         error,
         'query',
@@ -394,6 +401,9 @@ export class YdbConnection implements SqlConnection {
       );
       for (const set of result.resultSets)
         for (const row of set?.rows ?? []) yield project(row) as Row;
+    } catch (error) {
+      this.#failed = true;
+      throw error;
     } finally {
       this.#streams--;
     }
@@ -403,11 +413,16 @@ export class YdbConnection implements SqlConnection {
     request: YdbSqlExecuteRequest,
     expected?: ActiveTransaction,
   ): Promise<SqlStatementStats> {
-    const result = await this.executeYql(
-      sqlRequest(request, this.#config.readTransactionMode, true),
-      expected,
-    );
-    return { affectedRows: result.affectedRows };
+    try {
+      const result = await this.executeYql(
+        sqlRequest(request, this.#config.readTransactionMode, true),
+        expected,
+      );
+      return { affectedRows: result.affectedRows };
+    } catch (error) {
+      this.#failed = true;
+      throw error;
+    }
   }
 
   /** Local only: the server transaction starts with the first statement. */
@@ -493,6 +508,7 @@ export class YdbConnection implements SqlConnection {
         throw new SqlConnectionError('YDB connection has been released');
       return await run(scope.signal);
     } catch (error) {
+      this.#failed = true;
       failure = normalizeError(
         error,
         operation,
