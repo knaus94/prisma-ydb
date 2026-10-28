@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.8
 
 - Add `ydbTransactionRetryPolicy` with configurable unique-violation retry and backoff.
 - Add transaction-wide `retry.budgetMs`, caller `signal` and `onRetry`; preserve uncertain commit outcomes during cancellation.
