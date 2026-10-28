@@ -1,6 +1,6 @@
 {
   "name": "prisma-ydb",
-  "version": "0.1.0-rc.5",
+  "version": "0.1.0-rc.6",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -149,7 +149,5 @@
       }
     }
   },
-  "bin": {
-    "prisma-ydb": "./dist/cli.js"
-  }
+  "bin": "./dist/cli.js"
 }

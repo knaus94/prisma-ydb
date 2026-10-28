@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.6
 
 - Accept exact `bigint` microseconds and `TimestampMicrosValue` in `DateTime` writes (ORM, `yqlModel`, `bulkUpsert`); add opt-in `bigint` microsecond results through `yqlModel(name, { micros })`. ORM `DateTime` reads remain `Date`, and the stored JSON form of millisecond instants is unchanged.
 - Add per-partition changefeed `stop(reason)`, `pause()` and `resume()` in `onPartitionStart` and on batch partitions, so one refused partition no longer ends the iterator. Add `commitThrough(event)` and its alias `skip(event)` to acknowledge a decoded poison event. Commits on a stopped partition reject; `batch.commit()` skips stopped partitions.

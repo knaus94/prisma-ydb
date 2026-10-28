@@ -6550,6 +6550,8 @@ __metadata:
     "@ydbjs/topic": "npm:6.1.4"
     "@ydbjs/value": "npm:6.0.8"
     tslib: "npm:^2.3.0"
+  bin:
+    prisma-ydb: ./dist/cli.js
   languageName: unknown
   linkType: soft
 
