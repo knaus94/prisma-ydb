@@ -196,6 +196,8 @@ interface YdbClientLifecycle<C extends Contract<SqlStorage>> {
       readonly fields?: readonly Field[];
       readonly micros?: readonly Micros[];
       readonly extra?: Extra;
+      /** `ignore` encodes wider domain rows without copying; default `reject`. */
+      readonly extraFields?: 'reject' | 'ignore';
     },
   ): YdbYqlModel<
     Pick<YdbYqlInput<C, Name>, Field> & {

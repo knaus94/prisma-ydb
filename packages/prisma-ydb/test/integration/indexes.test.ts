@@ -250,3 +250,74 @@ test('ORM index reads, bounded descending scans and composite key lists use keye
     await client.deleteSession({ sessionId: session.sessionId });
   }
 });
+
+test('scanIndex ranges keep out-of-range rows out of the scan budget', async (context) => {
+  const fixture = await createFixture(context, {
+    schema: (table) =>
+      [
+        '// use prisma-8',
+        'model Operation {',
+        '  id String @id',
+        '  owner String',
+        '  createdAt DateTime',
+        '  status String',
+        '  @@index([owner, createdAt], map: "operation_by_created")',
+        `  @@map("${table('Operation')}")`,
+        '}',
+      ].join('\n'),
+  });
+  const { db } = fixture;
+  await fixture.ddl(
+    `CREATE TABLE ${quote(fixture.table('Operation'))} (id Utf8 NOT NULL, owner Utf8 NOT NULL, createdAt Timestamp NOT NULL, status Utf8 NOT NULL, PRIMARY KEY (id), INDEX operation_by_created GLOBAL SYNC ON (owner, createdAt));`,
+  );
+  const day = 86_400_000_000n;
+  const start = 1767225600000000n; // 2026-01-01T00:00:00Z
+  // Days 0..6; the range [day 2, day 5) holds days 2, 3 and 4 only.
+  for (let index = 0; index < 7; index++)
+    await db.orm.Operation.create({
+      id: `op${index}`,
+      owner: 'alice',
+      createdAt: start + BigInt(index) * day,
+      status: index === 3 ? 'settled' : 'pending',
+    });
+  const range = {
+    field: 'createdAt',
+    gte: new Date(Number((start + 2n * day) / 1000n)),
+    lt: start + 5n * day,
+  } as const;
+  const first = await db.scanIndex('Operation', {
+    index: 'operation_by_created',
+    equal: { owner: 'alice' },
+    range,
+    budget: 2,
+    select: ['id', 'status'],
+    accept: (row) => row.status === 'settled',
+  });
+  assert.deepEqual(first.rows, [{ id: 'op3', status: 'settled' }]);
+  assert.equal(first.inspected, 2);
+  assert.deepEqual(first.lastKey, { createdAt: start + 3n * day, id: 'op3' });
+  assert.equal(first.exhausted, false);
+  const rest = await db.scanIndex('Operation', {
+    index: 'operation_by_created',
+    equal: { owner: 'alice' },
+    range,
+    after: first.lastKey,
+    budget: 2,
+    select: ['id'],
+  });
+  assert.deepEqual(rest.rows, [{ id: 'op4' }]);
+  assert.equal(rest.inspected, 1);
+  assert.equal(rest.exhausted, true);
+  const newest = await db.scanIndex('Operation', {
+    index: 'operation_by_created',
+    equal: { owner: 'alice' },
+    range: { field: 'createdAt', lt: start + 5n * day },
+    direction: 'desc',
+    budget: 2,
+    select: ['id'],
+  });
+  assert.deepEqual(
+    newest.rows.map((row) => row.id),
+    ['op4', 'op3'],
+  );
+});

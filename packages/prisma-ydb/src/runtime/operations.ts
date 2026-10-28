@@ -10,7 +10,8 @@ import type {
   AnyExpression,
   AnyQueryAst,
 } from '@prisma/orm-family-sql/relational-core/ast';
-import { encodeYdbJson, encodeYdbValue } from './codecs.js';
+import type { FunctionCondition } from '@prisma/orm-family-sql/orm-client';
+import { encodeYdbJson, encodeYdbValue, type CodecTypes } from './codecs.js';
 import { defineAnnotation } from '@prisma/orm-framework/components/runtime';
 import type { SqlMiddleware } from '@prisma/orm-family-sql/runtime';
 import {
@@ -236,10 +237,39 @@ export const ydbReadMiddleware: SqlMiddleware = {
   },
 };
 
-/** A typed tuple-list predicate for a primary key or secondary-index prefix. */
-export function whereKeys<Scope extends Record<string, Expression<ScopeField>>>(
+type WhereKeyValue<Value> =
+  Value extends Expression<infer Field>
+    ? Field extends { readonly codecId: infer Id }
+      ? Id extends keyof CodecTypes
+        ? CodecTypes[Id]['input']
+        : unknown
+      : never
+    : never;
+/** Scalar fields of a model accessor; relation accessors are not key fields. */
+export type YdbWhereKeyFields<Scope> = {
+  readonly [Name in keyof Scope as [WhereKeyValue<Scope[Name]>] extends [never]
+    ? never
+    : Name]?: WhereKeyValue<Scope[Name]>;
+};
+
+/**
+ * A typed tuple-list predicate for a primary key or secondary-index prefix.
+ * Typed as Prisma's `fns` condition, which rc.18 fixes to `pg/bool@1`, so it
+ * composes with `where` callbacks and `and`/`or`; the YQL is unchanged.
+ */
+export function whereKeys<Scope extends object>(
   scope: Scope,
-  keys: readonly { readonly [Field in keyof Scope]?: unknown }[],
+  keys: readonly YdbWhereKeyFields<Scope>[],
+): FunctionCondition {
+  return buildWhereKeys(
+    scope as Readonly<Record<string, unknown>>,
+    keys as readonly Readonly<Record<string, unknown>>[],
+  ) as unknown as FunctionCondition;
+}
+
+function buildWhereKeys(
+  scope: Readonly<Record<string, unknown>>,
+  keys: readonly Readonly<Record<string, unknown>>[],
 ): Expression<{ codecId: 'ydb/bool@1'; nullable: false }> {
   if (!Array.isArray(keys)) throw new TypeError('whereKeys requires an array');
   if (!keys.length)
@@ -252,8 +282,9 @@ export function whereKeys<Scope extends Record<string, Expression<ScopeField>>>(
   const names = Object.keys(keys[0] ?? {});
   if (!names.length) throw new TypeError('whereKeys requires nonempty keys');
   const expressions = names.map((name) => {
-    const field = scope[name];
-    if (!field) throw new TypeError(`Unknown whereKeys field ${name}`);
+    const field = scope[name] as Expression<ScopeField> | undefined;
+    if (typeof field?.buildAst !== 'function')
+      throw new TypeError(`Unknown whereKeys field ${name}`);
     const ast = field.buildAst();
     const codec = codecOf(field);
     if (

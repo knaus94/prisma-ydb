@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
-import { ydb, Text } from 'prisma-ydb/runtime';
+import { and } from '@prisma/orm-family-sql/orm-client';
+import { ydb, Text, whereKeys } from 'prisma-ydb/runtime';
 import { ydbBindingFromEnv } from 'prisma-ydb/environment';
 import type { Contract } from './generated/contract.d.js';
 import contractJson from './generated/contract.json' with { type: 'json' };
@@ -67,6 +68,17 @@ try {
   );
   console.log('Known task status:', Status.has(task?.status));
   console.log('Typed task history:', await taskHistory(db, { projectId }));
+  const taskKeys = [{ id: taskId }];
+  console.log(
+    'Tasks by key list:',
+    await db.orm.Task.where((t) => whereKeys(t, taskKeys)).all(),
+  );
+  console.log(
+    'Open tasks by key list:',
+    await db.orm.Task.where((t) =>
+      and(t.done.eq(false), whereKeys(t, taskKeys)),
+    ).all(),
+  );
   console.log(
     'Included task dates:',
     await db.orm.Project.where({ id: projectId })

@@ -60,6 +60,8 @@ export interface YdbIndexScanOptions<
   readonly index: string;
   /** Equality on a nonempty leading prefix of the index, using model fields. */
   readonly equal: Partial<Input>;
+  /** Server-side bounds on the first index field after the `equal` prefix. */
+  readonly range?: YdbIndexScanRange<Input>;
   /** Remaining index fields, then the primary-key tail, returned by lastKey. */
   readonly after?: Partial<Input>;
   readonly budget: number;
@@ -69,6 +71,22 @@ export interface YdbIndexScanOptions<
   readonly accept?: (row: Pick<Output, Field>) => boolean;
   readonly signal?: AbortSignal;
 }
+export type YdbIndexScanRange<Input> = {
+  [Field in keyof Input & string]: {
+    readonly field: Field;
+    readonly gt?: NonNullable<Input[Field]>;
+    readonly gte?: NonNullable<Input[Field]>;
+    readonly lt?: NonNullable<Input[Field]>;
+    readonly lte?: NonNullable<Input[Field]>;
+  };
+}[keyof Input & string];
+type RangeBound = 'gt' | 'gte' | 'lt' | 'lte';
+const rangeOperators: Record<RangeBound, string> = {
+  gt: '>',
+  gte: '>=',
+  lt: '<',
+  lte: '<=',
+};
 export interface YdbIndexScanResult<Row, Input> {
   readonly rows: Row[];
   readonly inspected: number;
@@ -86,8 +104,9 @@ interface IndexScanPlan {
     decode(value: unknown): unknown;
   }[];
   readonly bindings: readonly {
-    field: string;
-    after: boolean;
+    /** Where the value comes from: equal/after by field, range by bound. */
+    source: 'equal' | 'after' | 'range';
+    key: string;
     name: string;
     encode(value: unknown): YdbParameter;
   }[];
@@ -106,6 +125,7 @@ function compileIndexScan(
   hasAfter: boolean,
   direction: 'asc' | 'desc',
   selected: readonly string[],
+  range: { field: string; bounds: readonly RangeBound[] } | undefined,
 ): IndexScanPlan {
   const model = resolveModel(contract, name);
   const index = model.definition.indexes.find(
@@ -138,7 +158,11 @@ function compileIndexScan(
     );
   const declarations: string[] = [];
   const bindings: IndexScanPlan['bindings'][number][] = [];
-  const bind = (column: ModelColumn, after: boolean) => {
+  const bind = (
+    column: ModelColumn,
+    source: IndexScanPlan['bindings'][number]['source'],
+    key = column.field,
+  ) => {
     const name = `k${bindings.length}`;
     const typeName = yqlTypeForCodec(column.codecId, column.typeParams);
     const type = parameterType(typeName);
@@ -148,19 +172,31 @@ function compileIndexScan(
     ).encode;
     declarations.push(`DECLARE $${name} AS ${typeName};`);
     bindings.push({
-      field: column.field,
-      after,
+      source,
+      key,
       name,
       encode: (value) => ({ type, value: encode(value) }),
     });
     return `$${name}`;
   };
   const predicates = equal.map(
-    (column) => `${quoteYqlIdentifier(column.column)} = ${bind(column, false)}`,
+    (column) =>
+      `${quoteYqlIdentifier(column.column)} = ${bind(column, 'equal')}`,
   );
+  if (range) {
+    const column = indexColumns[prefix];
+    if (!column || column.field !== range.field)
+      throw new TypeError(
+        'scanIndex range must target the first index field after equal',
+      );
+    for (const bound of range.bounds)
+      predicates.push(
+        `${quoteYqlIdentifier(column.column)} ${rangeOperators[bound]} ${bind(column, 'range', bound)}`,
+      );
+  }
   if (hasAfter) {
     const left = cursor.map((column) => quoteYqlIdentifier(column.column));
-    const right = cursor.map((column) => bind(column, true));
+    const right = cursor.map((column) => bind(column, 'after'));
     const tuple = (parts: string[]) =>
       parts.length === 1 ? parts[0] : `AsTuple(${parts.join(', ')})`;
     predicates.push(
@@ -236,6 +272,26 @@ export async function scanModelIndex<
   const selected =
     options.select ??
     resolveModel(contract, name).columns.map((column) => column.field);
+  const range = options.range as
+    | (Readonly<Record<RangeBound, unknown>> & { readonly field: string })
+    | undefined;
+  let rangeShape: { field: string; bounds: RangeBound[] } | undefined;
+  if (range !== undefined) {
+    if (!range || typeof range !== 'object' || typeof range.field !== 'string')
+      throw new TypeError('scanIndex range requires a field and bounds');
+    const bounds = (Object.keys(rangeOperators) as RangeBound[]).filter(
+      (bound) => range[bound] !== undefined,
+    );
+    if (
+      !bounds.length ||
+      (bounds.includes('gt') && bounds.includes('gte')) ||
+      (bounds.includes('lt') && bounds.includes('lte'))
+    )
+      throw new TypeError(
+        'scanIndex range needs at most one lower (gt/gte) and one upper (lt/lte) bound',
+      );
+    rangeShape = { field: range.field, bounds };
+  }
   let plans = indexScanPlans.get(contract);
   if (!plans) indexScanPlans.set(contract, (plans = new Map()));
   const cacheKey = JSON.stringify([
@@ -245,6 +301,7 @@ export async function scanModelIndex<
     options.after !== undefined,
     direction,
     selected,
+    rangeShape ?? null,
   ]);
   let plan = plans.get(cacheKey);
   if (!plan) {
@@ -256,6 +313,7 @@ export async function scanModelIndex<
       options.after !== undefined,
       direction,
       selected,
+      rangeShape,
     );
     if (plans.size >= 256) plans.delete(plans.keys().next().value!);
     plans.set(cacheKey, plan);
@@ -280,9 +338,15 @@ export async function scanModelIndex<
     budget: new Uint64(BigInt(options.budget)),
   };
   for (const binding of plan.bindings) {
-    const value = (binding.after ? after! : equal)[binding.field];
+    const source: Readonly<Record<string, unknown>> =
+      binding.source === 'equal'
+        ? equal
+        : binding.source === 'after'
+          ? after!
+          : range!;
+    const value = source[binding.key];
     if (value === null || value === undefined)
-      throw new TypeError(`scanIndex key ${binding.field} cannot be null`);
+      throw new TypeError(`scanIndex key ${binding.key} cannot be null`);
     parameters[binding.name] = binding.encode(value);
   }
   const result = await target.queryYql({

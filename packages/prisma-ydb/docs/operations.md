@@ -199,6 +199,21 @@ const rows = await db.orm.Wallet.where((wallet) =>
 ).all();
 ```
 
+`whereKeys` is typed as a Prisma `fns` condition, so it is a valid `where`
+callback result and combines with `and`/`or` from
+`@prisma/orm-family-sql/orm-client`:
+
+```ts
+import { and } from '@prisma/orm-family-sql/orm-client';
+
+const open = await db.orm.Wallet.where((wallet) =>
+  and(wallet.notify.eq(true), whereKeys(wallet, keys)),
+).all();
+```
+
+Key objects accept the scalar fields of the model with their input types;
+relation fields are not keys.
+
 Fields must follow the primary key or a secondary index's leading column order;
 key-object field order must follow the declared key/index column order, and
 all rows must supply the same fields, with nonnull scalar values. A matching
@@ -235,6 +250,7 @@ const page = await db.scanIndex('Operation', {
   index: 'operation_by_created',
   equal: { ownerId },
   direction: 'desc',
+  range: { field: 'createdAt', gte: createdFrom, lt: createdTo },
   budget: 100,
   select: ['id', 'createdAt', 'status'],
   after: previousPage?.lastKey,
@@ -242,6 +258,13 @@ const page = await db.scanIndex('Operation', {
 });
 // page.rows, page.inspected, page.lastKey, page.exhausted
 ```
+
+`range` bounds the first index field after the `equal` prefix on the server, so
+rows outside it never reach `accept` or consume the budget, and `inspected`,
+`lastKey` and `exhausted` describe the bounded range only. It takes at most one
+lower (`gt`/`gte`) and one upper (`lt`/`lte`) bound, typed as that field's input
+(Timestamp bounds accept `Date`, exact `bigint` microseconds or
+`TimestampMicrosValue`). Keep the same `range` while paging with `lastKey`.
 
 `equal` must be a nonempty leading index prefix. The cursor contains the remaining
 index fields followed by primary-key fields absent from the index/prefix. Reuse

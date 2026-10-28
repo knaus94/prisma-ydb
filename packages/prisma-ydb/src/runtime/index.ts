@@ -62,6 +62,7 @@ export {
   ydbQueryOperations,
   ydbView,
   whereKeys,
+  type YdbWhereKeyFields,
   ydbReadMiddleware,
   type YdbJsonPath,
 } from './operations.js';
@@ -139,7 +140,11 @@ export {
   type YdbYqlStatement,
 } from './yql-statement.js';
 
-export type { YdbIndexScanOptions, YdbIndexScanResult } from './keys.js';
+export type {
+  YdbIndexScanOptions,
+  YdbIndexScanRange,
+  YdbIndexScanResult,
+} from './keys.js';
 
 export {
   defineYql,

@@ -244,3 +244,36 @@ test('YQL descriptors encode exact clocks, safe integers and value-free containe
     /Timestamp field/,
   );
 });
+
+test('yqlModel extraFields ignore encodes wider domain rows without rejecting them', async (context) => {
+  const { ydbInt32 } = await import('prisma-ydb/runtime');
+  const { contract } = await compileHarness(
+    context,
+    '// use prisma-8\nmodel Item {\n id String @id\n name String\n}',
+  );
+  const strict = yqlModel(contract, 'Item');
+  assert.throws(
+    () => strict.row({ id: 'one', name: 'n', domainOnly: true } as never),
+    /Unknown field domainOnly/,
+  );
+  const wide = yqlModel(contract, 'Item', { extraFields: 'ignore' });
+  const domainRow = { id: 'one', name: 'n', domainOnly: true, nested: {} };
+  assert.deepEqual(
+    wide.row(domainRow).value,
+    strict.row({ id: 'one', name: 'n' }).value,
+  );
+  assert.deepEqual(wide.rows([domainRow, domainRow]).value.items.length, 2);
+  const withExtra = yqlModel(contract, 'Item', {
+    extraFields: 'ignore',
+    extra: { owner: ydbInt32 },
+  });
+  assert.equal(withExtra.row({ ...domainRow, owner: 7 }).value.items.length, 3);
+  assert.throws(
+    () => withExtra.row(domainRow as never),
+    /Missing extra YQL field owner/,
+  );
+  assert.throws(
+    () => yqlModel(contract, 'Item', { extraFields: 'drop' as never }),
+    /reject or ignore/,
+  );
+});

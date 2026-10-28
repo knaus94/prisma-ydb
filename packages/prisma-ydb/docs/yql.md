@@ -363,6 +363,9 @@ const clock = db.yqlModel('Task', {
 
 `micros` requires selected scalar Timestamp fields. `extra` names must be valid
 identifiers and cannot collide with any model field or physical column.
+Encoding rejects row properties outside the model by default. Pass
+`extraFields: 'ignore'` to encode wider domain objects directly: the model reads
+only its own (and `extra`) fields and neither copies nor scans the row.
 DateTime ORM results remain JavaScript Dates. In the pinned Prisma 8 ORM,
 `Collection.select` accepts field names and provides no per-query codec or
 computed-expression projection. Use the `Timestamp` scalar (`ydb/timestamp-us@1`)

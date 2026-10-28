@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix `whereKeys` typing: it returns Prisma's `fns` condition type, so `where((m) => whereKeys(m, keys))` and `and(m.flag.eq(true), whereKeys(m, keys))` compile, and it accepts model accessors with relations. Key objects are typed by the model's scalar field inputs. The generated YQL is unchanged.
+- Add `range: { field, gt | gte, lt | lte }` to `db.scanIndex`: server-side bounds on the first index field after `equal`, so out-of-range rows no longer consume the budget or affect `inspected`, `lastKey` and `exhausted`.
+- Add `yqlModel(name, { extraFields: 'ignore' })` to encode wider domain rows without copying them; the default still rejects unknown fields.
+
 ## 0.1.0-rc.6
 
 - Accept exact `bigint` microseconds and `TimestampMicrosValue` in `DateTime` writes (ORM, `yqlModel`, `bulkUpsert`); add opt-in `bigint` microsecond results through `yqlModel(name, { micros })`. ORM `DateTime` reads remain `Date`, and the stored JSON form of millisecond instants is unchanged.

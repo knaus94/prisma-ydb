@@ -269,3 +269,84 @@ test('top-level index annotations and composite tuple-list lookups compile nativ
   assert.match(deleted, /DELETE FROM `Wallet`/);
   assert.doesNotMatch(deleted, /VIEW/);
 });
+
+test('scanIndex ranges bound the first index field after equal on the server', async (context) => {
+  const { scanModelIndex } = await import('../../dist/runtime/keys.js');
+  const { contract } = await compileHarness(
+    context,
+    [
+      '// use prisma-8',
+      'model Operation {',
+      '  id String @id',
+      '  owner String',
+      '  createdAt DateTime',
+      '  status String',
+      '  @@index([owner, createdAt], map: "operation_by_created")',
+      '}',
+    ].join('\n'),
+  );
+  const requests: { text: string; parameters: Record<string, unknown> }[] = [];
+  const target = {
+    queryYql: async (request: {
+      text: string;
+      parameters?: Record<string, unknown>;
+    }) => {
+      requests.push({
+        text: request.text,
+        parameters: request.parameters ?? {},
+      });
+      return { resultSets: [{ columns: [], rows: [] }] } as never;
+    },
+  };
+  const scan = (range: unknown) =>
+    scanModelIndex(
+      target,
+      contract,
+      'Operation' as never,
+      {
+        index: 'operation_by_created',
+        equal: { owner: 'alice' },
+        range,
+        budget: 10,
+        select: ['id'],
+      } as never,
+    );
+  const from = new Date('2026-01-01T00:00:00.000Z');
+  const to = 1767312000000001n;
+  await scan({ field: 'createdAt', gte: from, lt: to });
+  const bounded = requests.at(-1)!;
+  assert.match(
+    bounded.text,
+    /WHERE `owner` = \$k0 AND `createdAt` >= \$k1 AND `createdAt` < \$k2 ORDER BY/,
+  );
+  const micros = (name: string) =>
+    (
+      bounded.parameters[name] as {
+        value: { value: { value: bigint } };
+      }
+    ).value.value.value;
+  assert.equal(micros('k1'), 1767225600000000n);
+  assert.equal(micros('k2'), to);
+
+  // Each bound shape compiles its own cached plan.
+  await scan({ field: 'createdAt', gt: from });
+  assert.match(requests.at(-1)!.text, /`createdAt` > \$k1 ORDER BY/);
+  await scan({ field: 'createdAt', lte: to });
+  assert.match(requests.at(-1)!.text, /`createdAt` <= \$k1 ORDER BY/);
+  await scan({ field: 'createdAt', gte: from, lt: to });
+  assert.equal(requests.at(-1)!.text, bounded.text);
+
+  await assert.rejects(scan({ field: 'createdAt' }), /at most one lower/);
+  await assert.rejects(
+    scan({ field: 'createdAt', gt: from, gte: from }),
+    /at most one lower/,
+  );
+  await assert.rejects(
+    scan({ field: 'createdAt', lt: to, lte: to }),
+    /one upper/,
+  );
+  await assert.rejects(
+    scan({ field: 'status', gte: 'a' }),
+    /first index field after equal/,
+  );
+});

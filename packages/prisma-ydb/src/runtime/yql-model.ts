@@ -123,6 +123,8 @@ export function yqlModel<
     readonly fields?: readonly Field[];
     readonly micros?: readonly Micros[];
     readonly extra?: Extra;
+    /** `ignore` encodes wider domain rows without copying; default `reject`. */
+    readonly extraFields?: 'reject' | 'ignore';
   } = {},
 ): YdbYqlModel<
   Pick<YdbYqlInput<C, Name>, Field> & {
@@ -137,6 +139,10 @@ export function yqlModel<
   } & { [Key in keyof Extra]: YdbTypeOutput<Extra[Key]> }
 > {
   const model = resolveModel(contract, name);
+  const extraFields = options.extraFields ?? 'reject';
+  if (extraFields !== 'reject' && extraFields !== 'ignore')
+    throw new TypeError('yqlModel extraFields must be reject or ignore');
+  const rejectExtraFields = extraFields === 'reject';
   const selected = options.fields
     ? options.fields.map((field) => {
         const column = model.byField.get(field);
@@ -238,9 +244,10 @@ export function yqlModel<
   const encode = (row: unknown, index: number) => {
     if (typeof row !== 'object' || row === null || Array.isArray(row))
       throw new TypeError(`Row ${index} must be an object`);
-    for (const field in row)
-      if (Object.hasOwn(row, field) && !fields.has(field))
-        throw new TypeError(`Unknown field ${field} on YQL model ${name}`);
+    if (rejectExtraFields)
+      for (const field in row)
+        if (Object.hasOwn(row, field) && !fields.has(field))
+          throw new TypeError(`Unknown field ${field} on YQL model ${name}`);
     const record = row as Readonly<Record<string, unknown>>;
     const value = encoder.row(record, index);
     for (const { field, codec } of extra) {
