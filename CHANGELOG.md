@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.5
 
 - Add `tx.commitWith(() => ...)` to commit with a single final direct statement, saving the separate commit RPC; ORM mutation scopes retain a normal atomic commit. Reject empty thunks and multiple direct statements.
 - Add per-path `active`, `total` and `errors` statistics for autocommit, streaming, bulk upload chunks and held leases, plus abandoned-stream counts in `db.stats()` and `driver.stats`.
